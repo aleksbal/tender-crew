@@ -24,7 +24,6 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Extract structured text and redact PII with optional preprocessing")
     p.add_argument("path", help="Path to input file (PDF or DOCX)")
     p.add_argument("-o", "--out", help="Output JSON file (default stdout)")
-    p.add_argument("--ocr", action="store_true", help="Run OCR (ocrmypdf) on input PDF before extraction")
     # NOTE: we avoid requiring LibreOffice by default; rendering DOCX to PDF
     # via soffice is intentionally omitted to keep the pipeline lightweight.
     p.add_argument("--pandoc-ast", action="store_true", help="Export pandoc JSON AST for DOCX (requires pandoc installed)")
@@ -41,7 +40,7 @@ def main(argv=None):
 
     try:
         # delegate conversion / preprocessing to converter component
-        conv = convert_input(str(src), ocr=args.ocr, pandoc_ast=args.pandoc_ast)
+        conv = convert_input(str(src), pandoc_ast=args.pandoc_ast)
         work_path = conv.get("work_path", src)
         tmp_files = conv.get("tmp_files", [])
         pandoc_ast = conv.get("pandoc_ast")

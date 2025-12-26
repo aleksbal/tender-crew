@@ -1,24 +1,19 @@
 pymupdf>=1.23.0
 python-docx>=0.8.11
-# Optional / recommended for preprocessing and OCR
-# Note: these Python packages often require system binaries (tesseract, libreoffice, pandoc)
-ocrmypdf>=13.0
-pytesseract>=0.3.10
-Pillow>=9.0.0
 
-# Testing
+# Testing / runtime
 pytest>=7.0
 requests>=2.0
 jsonschema>=4.0
 openai>=1.0
-# Notes: The Python package `ocrmypdf` is included above, but the
-# system binaries below are required for full OCR functionality.
-# Install these with your system package manager (example for Debian/Ubuntu):
-#   sudo apt update && sudo apt install -y tesseract-ocr qpdf ghostscript poppler-utils
-# Optional tesseract language packs (e.g. German):
-#   sudo apt install -y tesseract-ocr-deu
+
+# Optional / dev tools (uncomment to install for development)
+# black>=23.0
+# isort>=5.0
+# pre-commit>=3.0
+# mypy>=1.0
 
 # Tools (install via system package manager):
-# - tesseract-ocr (required by pytesseract/ocrmypdf)
-# - libreoffice (soffice) for headless DOCX->PDF rendering
-# - pandoc for DOCX -> structured JSON AST
+# - qpdf (useful for PDF tooling)
+# - ghostscript / poppler-utils (PDF handling utilities)
+# - pandoc for DOCX -> structured JSON AST (optional)

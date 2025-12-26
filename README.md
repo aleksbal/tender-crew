@@ -43,8 +43,7 @@ Notes
 -----
 - The extractor returns structured output: pages → blocks → lines (with bounding boxes and character spans when available).
 - The redactor accepts the structured form and records redaction metadata (page/block/line indices and char spans).
-- Scanned/bitmap PDFs without embedded text can be processed using the `--ocr` flag, which runs `ocrmypdf` (requires the system packages listed below).
-- Conversion and preprocessing are delegated to a reusable `converter.py` component so the CLI remains lightweight and the conversion logic can be reused in larger pipelines.
+-- Conversion and preprocessing are delegated to a reusable `converter.py` component so the CLI remains lightweight and the conversion logic can be reused in larger pipelines.
 
 Next steps
 ----------
@@ -66,22 +65,15 @@ Preprocessing tools
 -------------------
 Some preprocessing features require system binaries. Below are the recommended system packages and how they integrate:
 
-Required system packages for OCR (`--ocr` / `ocrmypdf`):
+Optional system packages
 
 ```bash
+# For certain preprocessing tasks you may want these tools installed:
 sudo apt update
-# OCR engine
-sudo apt install -y tesseract-ocr
-# PDF toolkit used by ocrmypdf
+# PDF toolkit
 sudo apt install -y qpdf
 # Ghostscript / poppler utilities used for PDF handling
 sudo apt install -y ghostscript poppler-utils
-```
-
-Optional language packs for Tesseract (example German):
-
-```bash
-sudo apt install -y tesseract-ocr-deu
 ```
 
 Python packages that enable OCR and preprocessing are listed in `requirements.txt` (e.g. `ocrmypdf`, `pytesseract`, `Pillow`). Note: the Python `ocrmypdf` package still requires the system binaries above.
@@ -99,7 +91,7 @@ sudo apt install -y libreoffice  # optional
 
 CLI flags recap:
 
-- `--ocr` (PDF only): run `ocrmypdf` before extraction to make scanned PDFs searchable. Requires the system packages above.
+Note: this project expects searchable PDF and DOCX inputs. OCR and scanned/PDF bitmap fallback are intentionally unsupported.
 - `--pandoc-ast` (DOCX only): produce a `pandoc` JSON AST and include it in the output JSON (requires `pandoc`).
 
 Using OpenAI via `--llm-kind`

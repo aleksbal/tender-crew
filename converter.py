@@ -14,7 +14,7 @@ def _run_cmd(cmd: list, *, check: bool = True):
     return subprocess.run(cmd, check=check)
 
 
-def convert_input(path: str, *, ocr: bool = False, pandoc_ast: bool = False):
+def convert_input(path: str, *, pandoc_ast: bool = False):
     """Convert or preprocess an input file and return a small context dict.
 
     Returns a dict with keys:
@@ -48,15 +48,6 @@ def convert_input(path: str, *, ocr: bool = False, pandoc_ast: bool = False):
             except Exception:
                 pandoc_ast = None
 
-    # If input is PDF and --ocr requested
-    if ocr and src.suffix.lower() == ".pdf":
-        if not _check_tool("ocrmypdf"):
-            # leave work_path as original; caller will warn
-            pass
-        else:
-            out_pdf = Path(tempfile.mkstemp(suffix=".pdf")[1])
-            tmp_files.append(out_pdf)
-            _run_cmd(["ocrmypdf", str(src), str(out_pdf)])
-            work_path = out_pdf
+    # OCR is intentionally unsupported in this project; expect searchable PDF/DOCX inputs.
 
     return {"work_path": work_path, "tmp_files": tmp_files, "pandoc_ast": pandoc_ast}
