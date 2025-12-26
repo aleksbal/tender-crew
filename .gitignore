@@ -1,0 +1,74 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.sublime-workspace
+*.swp
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.*
+
+# Jupyter
+.ipynb_checkpoints
+
+# Type check caches
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Logs and databases
+*.log
+*.sqlite3
+*.db
+*.bak
+
+# Sphinx build
+docs/_build/
+
+# Generated sample outputs and temp files
+sample_out*.json
+*.tmp
+*.temp
+*~
+sample_cv.docx
+realistic_cv.docx

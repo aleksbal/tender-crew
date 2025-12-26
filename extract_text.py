@@ -7,6 +7,9 @@ from typing import List, Tuple, Optional, Dict
 
 import fitz  # pymupdf
 from docx import Document
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
+from docx.table import Table
 
 
 @dataclass
@@ -310,35 +313,67 @@ def extract_text_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
     if ext == ".pdf":
         return _pdf_to_structured(path)
     if ext == ".docx":
-        # Build a simple single-page structured view for DOCX
+        # Build a structured view for DOCX, respecting explicit page breaks
         doc = Document(path)
-        diag = ExtractDiagnostics(file_type="docx", pages=1)
-        blocks_out: List[Dict] = []
+        pages_blocks: List[List[Dict]] = [[]]
 
-        for p in doc.paragraphs:
-            t = (p.text or "").strip()
-            if t:
-                norm_lines = _normalize_block(t)
-                blocks_out.append({
-                    "bbox": None,
-                    "text": "\n".join(norm_lines),
-                    "lines": [{"text": ln, "char_start": None, "char_end": None} for ln in norm_lines],
-                })
+        def para_has_page_break(par: Paragraph) -> bool:
+            # Look for run-level page break elements
+            for r in par.runs:
+                for br in r._r.findall(qn('w:br')):
+                    # check w:type attribute == 'page'
+                    if br.get(qn('w:type')) == 'page':
+                        return True
+            # also look for explicit lastRenderedPageBreak in paragraph xml
+            if 'lastRenderedPageBreak' in par._p.xml:
+                return True
+            return False
 
-        for table in doc.tables:
-            for row in table.rows:
-                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
-                if cells:
-                    t = " | ".join(cells)
+        # Iterate document body children to preserve order (paragraphs + tables)
+        body = doc.element.body
+        for child in body:
+            if child.tag == qn('w:p'):
+                p = Paragraph(child, doc)
+                t = (p.text or '').strip()
+                if t:
                     norm_lines = _normalize_block(t)
-                    blocks_out.append({
-                        "bbox": None,
-                        "text": "\n".join(norm_lines),
-                        "lines": [{"text": ln, "char_start": None, "char_end": None} for ln in norm_lines],
+                    pages_blocks[-1].append({
+                        'bbox': None,
+                        'text': '\n'.join(norm_lines),
+                        'lines': [{'text': ln, 'char_start': None, 'char_end': None} for ln in norm_lines],
                     })
+                if para_has_page_break(p):
+                    pages_blocks.append([])
+            elif child.tag == qn('w:tbl'):
+                tbl = Table(child, doc)
+                # Flatten rows
+                for row in tbl.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                    if cells:
+                        t = ' | '.join(cells)
+                        norm_lines = _normalize_block(t)
+                        pages_blocks[-1].append({
+                            'bbox': None,
+                            'text': '\n'.join(norm_lines),
+                            'lines': [{'text': ln, 'char_start': None, 'char_end': None} for ln in norm_lines],
+                        })
 
-        page_text = "\n\n".join(b["text"] for b in blocks_out)
-        page = {"page_number": 1, "width": None, "height": None, "page_text": page_text, "blocks": blocks_out}
-        return {"file_type": "docx", "pages": [page]}, diag
+        # Build pages output
+        pages_out: List[Dict] = []
+        for pi, blocks_out in enumerate(pages_blocks):
+            # skip empty trailing pages
+            if not blocks_out and pi == len(pages_blocks) - 1:
+                continue
+            page_text = '\n\n'.join(b['text'] for b in blocks_out)
+            pages_out.append({
+                'page_number': pi + 1,
+                'width': None,
+                'height': None,
+                'page_text': page_text,
+                'blocks': blocks_out,
+            })
+
+        diag = ExtractDiagnostics(file_type='docx', pages=len(pages_out))
+        return {'file_type': 'docx', 'pages': pages_out}, diag
 
     raise ValueError(f"Unsupported file type: {ext}")

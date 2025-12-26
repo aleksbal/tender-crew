@@ -60,3 +60,56 @@ Files of interest
 License
 -------
 MIT-style (see repo settings).
+
+Preprocessing tools
+-------------------
+Some preprocessing features require system binaries. Below are the recommended system packages and how they integrate:
+
+Required system packages for OCR (`--ocr` / `ocrmypdf`):
+
+```bash
+sudo apt update
+# OCR engine
+sudo apt install -y tesseract-ocr
+# PDF toolkit used by ocrmypdf
+sudo apt install -y qpdf
+# Ghostscript / poppler utilities used for PDF handling
+sudo apt install -y ghostscript poppler-utils
+```
+
+Optional language packs for Tesseract (example German):
+
+```bash
+sudo apt install -y tesseract-ocr-deu
+```
+
+Python packages that enable OCR and preprocessing are listed in `requirements.txt` (e.g. `ocrmypdf`, `pytesseract`, `Pillow`). Note: the Python `ocrmypdf` package still requires the system binaries above.
+
+Optional system tools (not required by default):
+
+```bash
+# Pandoc (DOCX -> structured JSON AST)
+sudo apt install -y pandoc
+
+# LibreOffice (soffice) can render DOCX -> PDF if you explicitly want layout bboxes,
+# but it is heavy and not required by default. Avoid unless you need exact visual rendering.
+sudo apt install -y libreoffice  # optional
+```
+
+CLI flags recap:
+
+- `--ocr` (PDF only): run `ocrmypdf` before extraction to make scanned PDFs searchable. Requires the system packages above.
+- `--pandoc-ast` (DOCX only): produce a `pandoc` JSON AST and include it in the output JSON (requires `pandoc`).
+
+Using OpenAI via `--llm-kind`
+-----------------------------
+You can use OpenAI as the LLM provider by selecting `--llm-kind openai`. The CLI will call the LLM client which in turn uses the `openai` Python package. Set your API key in the environment first:
+
+```bash
+export OPENAI_API_KEY="sk_your_key_here"
+python3 main.py resume.docx --llm --llm-kind openai --llm-model gpt-4o-mini -o out.json
+```
+
+If `OPENAI_API_KEY` is not set the OpenAI client will raise an error. The default LLM provider remains `ollama`.
+
+If system tools are not available the CLI prints a warning and falls back to the default extraction path.

@@ -9,9 +9,10 @@ EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE_RE = re.compile(
     r"""
     (?<!\w)
-    (?:\+?\d{1,3}[\s\-\.]?)?          # country code
-    (?:\(?0?\d{2,5}\)?[\s\-\.]?)      # area code
-    (?:\d[\d\s\-\.]{5,}\d)            # number body
+    (?=(?:.*\d){7,})                        # require at least 7 digits total
+    (?:\+?\d{1,3}[\s\-\.]?)?             # country code
+    (?:\(?0?\d{2,5}\)?[\s\-\.]?)        # area code
+    (?:\d[\d\s\-\.]{4,}\d)              # number body (min length)
     (?!\w)
     """,
     re.VERBOSE,
@@ -164,108 +165,9 @@ def redact_structured(structured: Dict, max_header_lines: int = 20) -> Tuple[Dic
     """
     redactions: List[Dict[str, Any]] = []
 
-    def _replace_line_patterns(page_idx: int, block_idx: int, line_idx: int, line: Dict[str, Any]):
-        text = line.get("text", "")
-        if not text:
-            return text
-
-        # helper to apply a pattern and record matches
-        def apply_pattern(pattern: re.Pattern, repl: str, kind: str):
-            nonlocal text
-            matches = list(pattern.finditer(text))
-            if not matches:
-                return
-            before = text
-            text = pattern.sub(repl, text)
-            for m in matches:
-                abs_start = None
-                abs_end = None
-                if line.get("char_start") is not None:
-                    abs_start = line["char_start"] + m.start()
-                    abs_end = line["char_start"] + m.end()
-                redactions.append({
-                    "kind": kind,
-                    "original": m.group(0),
-                    "replacement": repl,
-                    "page": page_idx,
-                    "block": block_idx,
-                    "line": line_idx,
-                    "char_start": abs_start,
-                    "char_end": abs_end,
-                })
-
-        apply_pattern(EMAIL_RE, "[REDACTED_EMAIL]", "email")
-        apply_pattern(PHONE_RE, "[REDACTED_PHONE]", "phone")
-        apply_pattern(STREET_RE, "[REDACTED_ADDRESS]", "address")
-        apply_pattern(POSTCODE_CITY_RE, "[REDACTED_ADDRESS]", "address")
-        # Address label
-        # For labels we redact entire line
-        if ADDRESS_LABEL_RE.search(text):
-            m = ADDRESS_LABEL_RE.search(text)
-            orig = text
-            text = ADDRESS_LABEL_RE.sub("[REDACTED_ADDRESS]", text)
-            abs_start = None
-            abs_end = None
-            if line.get("char_start") is not None and m:
-                abs_start = line["char_start"] + m.start()
-                abs_end = line["char_start"] + m.end()
-            redactions.append({
-                "kind": "address",
-                "original": orig[m.start(): m.end()] if m else orig,
-                "replacement": "[REDACTED_ADDRESS]",
-                "page": page_idx,
-                "block": block_idx,
-                "line": line_idx,
-                "char_start": abs_start,
-                "char_end": abs_end,
-            })
-
-        return text
-
-    # Iterate pages/blocks/lines and apply pattern-based redactions
     pages = structured.get("pages", [])
-    for pi, page in enumerate(pages):
-        for bi, block in enumerate(page.get("blocks", [])):
-            lines = block.get("lines", [])
-            for li, ln in enumerate(lines):
-                new_text = _replace_line_patterns(pi, bi, li, ln)
-                ln["text"] = new_text
 
-    # Name redaction heuristic: first page first non-empty line(s)
-    if pages:
-        first_page = pages[0]
-        found = False
-        for bi, block in enumerate(first_page.get("blocks", [])):
-            for li, ln in enumerate(block.get("lines", [])):
-                txt = ln.get("text", "").strip()
-                if not txt:
-                    continue
-                # candidate name
-                if _looks_like_name(txt):
-                    orig = txt
-                    block["lines"][li]["text"] = "[REDACTED_NAME]"
-                    abs_start = None
-                    abs_end = None
-                    if ln.get("char_start") is not None:
-                        abs_start = ln["char_start"]
-                        abs_end = ln["char_end"]
-                    redactions.append({
-                        "kind": "name",
-                        "original": orig,
-                        "replacement": "[REDACTED_NAME]",
-                        "page": 0,
-                        "block": bi,
-                        "line": li,
-                        "char_start": abs_start,
-                        "char_end": abs_end,
-                    })
-                    found = True
-                    break
-                # else try next non-empty line as second name line candidate
-            if found:
-                break
-
-    # Recompute block.text and page.page_text and per-line char spans (absolute)
+    # 0) Compute original absolute char spans for every line (before redaction)
     for pi, page in enumerate(pages):
         page_text_parts: List[str] = []
         for bi, block in enumerate(page.get("blocks", [])):
@@ -277,17 +179,151 @@ def redact_structured(structured: Dict, max_header_lines: int = 20) -> Tuple[Dic
         page_text = "\n\n".join(page_text_parts)
         page["page_text"] = page_text
 
-        # set absolute char spans for lines
+        # set absolute char spans for lines (original positions)
         offset = 0
         for bi, block in enumerate(page.get("blocks", [])):
-            lines = block.get("lines", [])
-            for li, ln in enumerate(lines):
+            for li, ln in enumerate(block.get("lines", [])):
                 txt = ln.get("text", "")
                 ln_start = offset
                 ln_end = ln_start + len(txt)
                 ln["char_start"] = ln_start
                 ln["char_end"] = ln_end
-                offset = ln_end + 1  # newline
+                offset = ln_end + 1  # newline within block
             offset += 1  # blank line between blocks
+
+    # 1) Apply regex redactions line-by-line, recording original absolute spans
+    def _apply_line_redactions(pi: int, bi: int, li: int, ln: Dict[str, Any]):
+        original = ln.get("text", "")
+        if not original:
+            return
+
+        # helper to apply pattern and record matches against original
+        def apply_pattern(pattern: re.Pattern, repl: str, kind: str):
+            nonlocal original
+            matches = list(pattern.finditer(original))
+            if not matches:
+                return
+
+            # If matching phones, filter out common year-range patterns like '2020-2024'
+            if kind == "phone":
+                matches = [m for m in matches if not re.search(r"\d{4}-\d{4}", m.group(0))]
+                if not matches:
+                    return
+
+            for m in matches:
+                abs_start = None
+                abs_end = None
+                if ln.get("char_start") is not None:
+                    abs_start = ln["char_start"] + m.start()
+                    abs_end = ln["char_start"] + m.end()
+                redactions.append({
+                    "kind": kind,
+                    "original": m.group(0),
+                    "replacement": repl,
+                    "page": pi,
+                    "block": bi,
+                    "line": li,
+                    "char_start": abs_start,
+                    "char_end": abs_end,
+                })
+
+        apply_pattern(EMAIL_RE, "[REDACTED_EMAIL]", "email")
+        apply_pattern(PHONE_RE, "[REDACTED_PHONE]", "phone")
+        apply_pattern(STREET_RE, "[REDACTED_ADDRESS]", "address")
+        apply_pattern(POSTCODE_CITY_RE, "[REDACTED_ADDRESS]", "address")
+
+        # Address label: redact the label substring if present
+        m = ADDRESS_LABEL_RE.search(original)
+        if m:
+            abs_start = None
+            abs_end = None
+            if ln.get("char_start") is not None:
+                abs_start = ln["char_start"] + m.start()
+                abs_end = ln["char_start"] + m.end()
+            redactions.append({
+                "kind": "address",
+                "original": original[m.start(): m.end()],
+                "replacement": "[REDACTED_ADDRESS]",
+                "page": pi,
+                "block": bi,
+                "line": li,
+                "char_start": abs_start,
+                "char_end": abs_end,
+            })
+
+        # Now produce the updated line text by applying substitutions on the original
+        updated = EMAIL_RE.sub("[REDACTED_EMAIL]", original)
+
+        # Replace phones only when they are not year ranges like '2020-2024'
+        def _phone_repl(m: re.Match) -> str:
+            s = m.group(0)
+            if re.search(r"\d{4}-\d{4}", s):
+                return s
+            return "[REDACTED_PHONE]"
+
+        updated = PHONE_RE.sub(_phone_repl, updated)
+        updated = STREET_RE.sub("[REDACTED_ADDRESS]", updated)
+        updated = POSTCODE_CITY_RE.sub("[REDACTED_ADDRESS]", updated)
+        updated = ADDRESS_LABEL_RE.sub("[REDACTED_ADDRESS]", updated)
+
+        ln["text"] = updated
+
+    for pi, page in enumerate(pages):
+        for bi, block in enumerate(page.get("blocks", [])):
+            for li, ln in enumerate(block.get("lines", [])):
+                _apply_line_redactions(pi, bi, li, ln)
+
+    # 2) Name redaction heuristic using the original spans (first non-empty line(s))
+    if pages:
+        first_page = pages[0]
+        found = False
+        for bi, block in enumerate(first_page.get("blocks", [])):
+            for li, ln in enumerate(block.get("lines", [])):
+                txt = ln.get("text", "").strip()
+                if not txt:
+                    continue
+                if _looks_like_name(txt):
+                    orig = txt
+                    abs_start = ln.get("char_start")
+                    abs_end = ln.get("char_end")
+                    redactions.append({
+                        "kind": "name",
+                        "original": orig,
+                        "replacement": "[REDACTED_NAME]",
+                        "page": 0,
+                        "block": bi,
+                        "line": li,
+                        "char_start": abs_start,
+                        "char_end": abs_end,
+                    })
+                    ln["text"] = "[REDACTED_NAME]"
+                    found = True
+                    break
+            if found:
+                break
+
+    # 3) Recompute block.text and page.page_text and updated per-line absolute spans
+    for pi, page in enumerate(pages):
+        page_text_parts = []
+        for bi, block in enumerate(page.get("blocks", [])):
+            line_texts = [ln.get("text", "") for ln in block.get("lines", [])]
+            block_text = "\n".join(line_texts)
+            block["text"] = block_text
+            page_text_parts.append(block_text)
+
+        page_text = "\n\n".join(page_text_parts)
+        page["page_text"] = page_text
+
+        # recompute absolute char spans for updated text
+        offset = 0
+        for bi, block in enumerate(page.get("blocks", [])):
+            for li, ln in enumerate(block.get("lines", [])):
+                txt = ln.get("text", "")
+                ln_start = offset
+                ln_end = ln_start + len(txt)
+                ln["char_start"] = ln_start
+                ln["char_end"] = ln_end
+                offset = ln_end + 1
+            offset += 1
 
     return structured, redactions
