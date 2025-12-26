@@ -43,7 +43,8 @@ Notes
 -----
 - The extractor returns structured output: pages → blocks → lines (with bounding boxes and character spans when available).
 - The redactor accepts the structured form and records redaction metadata (page/block/line indices and char spans).
-- Scanned/bitmap PDFs without embedded text are rejected by the current extractor (no OCR fallback yet).
+- Scanned/bitmap PDFs without embedded text can be processed using the `--ocr` flag, which runs `ocrmypdf` (requires the system packages listed below).
+- Conversion and preprocessing are delegated to a reusable `converter.py` component so the CLI remains lightweight and the conversion logic can be reused in larger pipelines.
 
 Next steps
 ----------

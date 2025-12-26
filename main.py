@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import shutil
-import subprocess
-import tempfile
 from typing import Tuple, Dict, Optional
 from pathlib import Path
 
@@ -11,6 +8,7 @@ from extract_text import extract_text_structured
 from redactor import redact_structured
 from llm_client import create_llm_client
 from jsonschema import validate as jsonschema_validate, ValidationError
+from converter import convert_input
 import time
 
 
@@ -41,37 +39,12 @@ def main(argv=None):
     if not src.exists():
         raise SystemExit(f"Input not found: {src}")
 
-    tmp_files = []
-    pandoc_ast = None
-
     try:
-        # Optional: produce pandoc AST for DOCX
-        if args.pandoc_ast and src.suffix.lower() == ".docx":
-            if not _check_tool("pandoc"):
-                print("Warning: pandoc not found; --pandoc-ast skipped")
-            else:
-                ast_out = Path(tempfile.mkstemp(suffix=".json")[1])
-                tmp_files.append(ast_out)
-                _run_cmd(["pandoc", "--from", "docx", "--to", "json", "-o", str(ast_out), str(src)])
-                try:
-                    with open(ast_out, "r", encoding="utf-8") as fh:
-                        pandoc_ast = json.load(fh)
-                except Exception:
-                    pandoc_ast = None
-
-        work_path = src
-
-        # If input is PDF and --ocr requested
-        if args.ocr and src.suffix.lower() == ".pdf":
-            if not _check_tool("ocrmypdf"):
-                print("Warning: ocrmypdf not found; --ocr skipped")
-            else:
-                out_pdf = Path(tempfile.mkstemp(suffix=".pdf")[1])
-                tmp_files.append(out_pdf)
-                _run_cmd(["ocrmypdf", str(src), str(out_pdf)])
-                work_path = out_pdf
-
-        # We do not render DOCX via soffice by default (heavy runtime dependency).
+        # delegate conversion / preprocessing to converter component
+        conv = convert_input(str(src), ocr=args.ocr, pandoc_ast=args.pandoc_ast)
+        work_path = conv.get("work_path", src)
+        tmp_files = conv.get("tmp_files", [])
+        pandoc_ast = conv.get("pandoc_ast")
 
         structured, diag = extract_text_structured(str(work_path))
         redacted_struct, redactions = redact_structured(structured)
