@@ -12,17 +12,30 @@ def test_generate_structured_retries(monkeypatch, tmp_path):
         def __init__(self):
             self.call_count = 0
 
-        def generate(self, prompt: str, model: str = None, max_length: int = None) -> str:
+        def generate(self, prompt: str, model: str = None, max_length: int = None, system_prompt: str = None) -> str:
             self.call_count += 1
-            # first call -> invalid
+            # first call -> invalid JSON
             if self.call_count == 1:
                 return "I am not JSON"
-            # second call -> valid JSON that conforms to schema.json
+            # second call -> valid JSON that conforms to schema.json (CV format)
             return json.dumps({
-                "file_type": "docx",
-                "pages": [
-                    {"page_number": 1, "blocks": [{"text": "x", "lines": [{"text": "x"}]}]}
-                ]
+                "personal_info": {
+                    "first_name": "Test",
+                    "last_name": "User",
+                    "phone": "",
+                    "email": ""
+                },
+                "summary": "",
+                "experience": [],
+                "education": [],
+                "skills": {
+                    "programming_languages": [],
+                    "technologies": [],
+                    "soft_skills": []
+                },
+                "projects": [],
+                "certifications": [],
+                "languages": []
             })
 
     # fake factory that returns our FakeClient and captures it
