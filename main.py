@@ -24,8 +24,6 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Extract structured text and redact PII with optional preprocessing")
     p.add_argument("path", help="Path to input file (PDF or DOCX)")
     p.add_argument("-o", "--out", help="Output JSON file (default stdout)")
-    # NOTE: we avoid requiring LibreOffice by default; rendering DOCX to PDF
-    # via soffice is intentionally omitted to keep the pipeline lightweight.
     p.add_argument("--pandoc-ast", action="store_true", help="Export pandoc JSON AST for DOCX (requires pandoc installed)")
     p.add_argument("--llm", action="store_true", help="Call local Ollama LLM to post-process structured output")
     p.add_argument("--llm-model", default="ollama/llama2", help="LLM model name for local Ollama")
