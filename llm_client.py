@@ -1,10 +1,8 @@
-"""LLM client abstraction.
+"""LLM client for transforming structured document data to JSON.
 
-Provides a minimal interface to call a local Ollama instance. Implementations
-should expose `generate(prompt, model, **kwargs) -> str`.
-
-You can add additional provider classes (OpenAI, local HTTP, etc.) and a
-factory `create_llm_client()` to choose at runtime.
+Provides a simple interface to call LLM providers (Ollama, OpenAI) for
+single query/response transformations. Not conversational - just sends
+system and user prompts and returns the JSON response.
 """
 from typing import Optional, Dict
 import requests
@@ -31,6 +29,7 @@ class LLMClient:
         Initialize LLM client with system prompt and user prompt template.
         Both are loaded once at construction time since they never change.
         """
+        # Load system prompt
         self.system_prompt = ""
         if system_prompt_path:
             spath = Path(system_prompt_path)
@@ -42,16 +41,18 @@ class LLMClient:
         
         # Load user prompt template
         self.user_prompt_template = ""
-        upath = Path(user_prompt_path) if user_prompt_path else Path("user_prompt.txt")
-        if upath.exists():
-            self.user_prompt_template = upath.read_text(encoding="utf-8")
-            logger.info(f"Loaded user prompt template from: {upath}")
-        else:
-            logger.warning(f"User prompt template file not found: {upath}")
+        if user_prompt_path:
+            upath = Path(user_prompt_path)
+            if upath.exists():
+                self.user_prompt_template = upath.read_text(encoding="utf-8")
+                logger.info(f"Loaded user prompt template from: {upath}")
+            else:
+                logger.warning(f"User prompt template file not found: {upath}")
     
-    def generate(self, prompt: str, model: str, max_length: int = 4096) -> str:
+    def _call_llm_api(self, user_prompt: str, model: str, max_length: int = 4096) -> str:
         """
-        Generate text from prompt using the system prompt loaded in constructor.
+        Internal method to call the LLM API with system and user prompts.
+        Implemented by subclasses.
         """
         raise NotImplementedError()
 
@@ -83,8 +84,8 @@ class LLMClient:
             else:
                 logger.warning(f"Schema file not found: {schema_path}")
 
-            # Extract readable text from structured data
-            document_text = extract_readable_text(structured)
+        # Extract readable text from structured data
+        document_text = extract_readable_text(structured)
         logger.info(f"Extracted document text for LLM (length: {len(document_text)} characters)")
         logger.info("=" * 80)
         logger.info("CV TEXT BEING SENT TO LLM:")
@@ -115,8 +116,8 @@ class LLMClient:
             attempt += 1
             logger.info(f"Attempt {attempt}/{max_retries} - Calling LLM with model: {model}")
             try:
-                # Use instance system_prompt (loaded in constructor)
-                raw = self.generate(user_prompt, model=model, max_length=max_length)
+                # Call LLM API with system prompt (loaded in constructor) and user prompt
+                raw = self._call_llm_api(user_prompt, model=model, max_length=max_length)
                 logger.info(f"Received response (length: {len(raw)} characters)")
                 last_response = raw
             except RuntimeError as e:
@@ -196,27 +197,22 @@ class OllamaClient(LLMClient):
         self.generate_url = f"{base_url}/api/generate"
         self.timeout = timeout
 
-    def generate(self, prompt: str, model: str = "ollama/llama2", max_length: int = 4096) -> str:
+    def _call_llm_api(self, user_prompt: str, model: str = "ollama/llama2", max_length: int = 8192) -> str:
         model_name = model.replace("ollama/", "") if model.startswith("ollama/") else model
 
         body = {
             "model": model_name,
-            "prompt": prompt,               # user content only
+            "prompt": user_prompt,
             "stream": False,
             "num_predict": max_length,
-            # Use Ollama's native system field (loaded in constructor)
             **({"system": self.system_prompt} if self.system_prompt else {}),
-            # Ask for strict JSON output
             "format": "json",
-            # Decoding & context knobs (tune as you like)
             "options": {
                 "temperature": 0,
                 "top_p": 1.0,
-                # "top_k": 1,   # enable if you want fully greedy
                 "seed": 1234,
                 "num_ctx": 8192
             },
-            # "keep_alive": "5m",  # optional: keep model warm between calls
         }
 
         try:
@@ -234,6 +230,7 @@ class OllamaClient(LLMClient):
             raise RuntimeError(f"Ollama API error: {e.response.status_code} - {e.response.text}") from e
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Failed to parse Ollama response as JSON: {e}") from e
+
 
 def create_llm_client(kind: str = "ollama", system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None, **kwargs) -> LLMClient:
     """
@@ -272,13 +269,13 @@ class OpenAIClient(LLMClient):
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OpenAI client: {e}") from e
 
-    def generate(self, prompt: str, model: str = "gpt-4o-mini", max_length: int = 2048) -> str:
+    def _call_llm_api(self, user_prompt: str, model: str = "gpt-4o-mini", max_length: int = 2048) -> str:
         try:
-            # Build messages with system prompt (loaded in constructor)
+            # Build messages with system prompt (loaded in constructor) and user prompt
             messages = []
             if self.system_prompt:
                 messages.append({"role": "system", "content": self.system_prompt})
-            messages.append({"role": "user", "content": prompt})
+            messages.append({"role": "user", "content": user_prompt})
             
             if self.use_client_api:
                 # Modern OpenAI SDK (v1.0+)

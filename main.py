@@ -4,13 +4,11 @@ import json
 import logging
 import shutil
 import subprocess
-from typing import Tuple, Dict, Optional
+from typing import Optional
 from pathlib import Path
 
 from extract_text import extract_text_structured
-from redactor import redact_structured
 from llm_client import create_llm_client
-from jsonschema import validate as jsonschema_validate, ValidationError
 from converter import convert_input
 import time
 
@@ -40,7 +38,8 @@ def main(argv=None):
     p.add_argument("--llm", action="store_true", help="Call local Ollama LLM to post-process structured output")
     p.add_argument("--llm-model", default="ollama/llama2", help="LLM model name for local Ollama")
     p.add_argument("--llm-kind", default="ollama", help="LLM provider kind (ollama|openai)")
-    p.add_argument("--system-prompt", default="system_prompt.txt", help="Path to system prompt file")
+    p.add_argument("--system-prompt", default="cv_extraction_system_prompt_v4.txt", help="Path to system prompt file")
+    p.add_argument("--user-prompt", default="cv_extraction_user_prompt_v4.txt", help="Path to user prompt template file")
     p.add_argument("--schema", default="schema.json", help="Path to JSON schema to present to LLM")
     args = p.parse_args(argv)
 
@@ -93,7 +92,11 @@ def main(argv=None):
             
             try:
                 logger.info("Creating LLM client...")
-                client = create_llm_client(kind=args.llm_kind, system_prompt_path=args.system_prompt)
+                client = create_llm_client(
+                    kind=args.llm_kind,
+                    system_prompt_path=args.system_prompt,
+                    user_prompt_path=args.user_prompt
+                )
                 logger.info(f"LLM client created: {type(client).__name__}")
                 
                 logger.info("Calling LLM to generate structured output...")

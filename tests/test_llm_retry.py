@@ -9,11 +9,14 @@ def test_generate_structured_retries(monkeypatch, tmp_path):
     from llm_client import LLMClient
 
     class FakeClient(LLMClient):
-        def __init__(self, system_prompt_path=None):
-            super().__init__(system_prompt_path=system_prompt_path)
+        def __init__(self, system_prompt_path=None, user_prompt_path=None):
+            super().__init__(system_prompt_path=system_prompt_path, user_prompt_path=user_prompt_path)
             self.call_count = 0
+            # Set a dummy user prompt template if none was loaded
+            if not self.user_prompt_template:
+                self.user_prompt_template = "DOCUMENT TEXT: {DOCUMENT_TEXT}\nJSON SCHEMA: {SCHEMA_TEXT}"
 
-        def generate(self, prompt: str, model: str = None, max_length: int = None) -> str:
+        def _call_llm_api(self, user_prompt: str, model: str = None, max_length: int = None) -> str:
             self.call_count += 1
             # first call -> invalid JSON
             if self.call_count == 1:
@@ -43,7 +46,7 @@ def test_generate_structured_retries(monkeypatch, tmp_path):
     created = {}
 
     def fake_factory(kind="ollama", system_prompt_path=None, user_prompt_path=None, **kwargs):
-        client = FakeClient(system_prompt_path=system_prompt_path)
+        client = FakeClient(system_prompt_path=system_prompt_path, user_prompt_path=user_prompt_path)
         created['client'] = client
         return client
 
