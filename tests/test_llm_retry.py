@@ -9,10 +9,11 @@ def test_generate_structured_retries(monkeypatch, tmp_path):
     from llm_client import LLMClient
 
     class FakeClient(LLMClient):
-        def __init__(self):
+        def __init__(self, system_prompt_path=None):
+            super().__init__(system_prompt_path=system_prompt_path)
             self.call_count = 0
 
-        def generate(self, prompt: str, model: str = None, max_length: int = None, system_prompt: str = None) -> str:
+        def generate(self, prompt: str, model: str = None, max_length: int = None) -> str:
             self.call_count += 1
             # first call -> invalid JSON
             if self.call_count == 1:
@@ -41,8 +42,8 @@ def test_generate_structured_retries(monkeypatch, tmp_path):
     # fake factory that returns our FakeClient and captures it
     created = {}
 
-    def fake_factory(kind="ollama", **kwargs):
-        client = FakeClient()
+    def fake_factory(kind="ollama", system_prompt_path=None, user_prompt_path=None, **kwargs):
+        client = FakeClient(system_prompt_path=system_prompt_path)
         created['client'] = client
         return client
 
@@ -58,6 +59,7 @@ def test_generate_structured_retries(monkeypatch, tmp_path):
     assert 'client' in created
     assert created['client'].call_count >= 2
 
-    # Ensure output file exists and contains structured key
+    # Ensure output file exists - when LLM is used, output is the LLM response directly (CV JSON)
     out = json.loads(Path(out_file).read_text(encoding="utf-8"))
-    assert 'structured' in out
+    # Should contain CV structure (personal_info, experience, etc.)
+    assert 'personal_info' in out or 'experience' in out or 'summary' in out

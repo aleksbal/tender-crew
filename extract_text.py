@@ -377,3 +377,86 @@ def extract_text_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
         return {'file_type': 'docx', 'pages': pages_out}, diag
 
     raise ValueError(f"Unsupported file type: {ext}")
+
+
+def extract_readable_text(structured: Dict) -> str:
+    """
+    Extract readable text from structured document data while preserving
+    important structural and spatial information that helps the LLM understand
+    document layout and context.
+    
+    Preserves:
+    - Page boundaries
+    - Block structure (groups of related text)
+    - Spatial hints (header area, column layout)
+    - Section markers
+    - Reading order (already in structured data)
+    """
+    pages = structured.get("pages", [])
+    if not pages:
+        return ""
+    
+    text_parts = []
+    for page_idx, page in enumerate(pages):
+        page_num = page.get("page_number", page_idx + 1)
+        page_width = page.get("width")
+        page_height = page.get("height")
+        blocks = page.get("blocks", [])
+        
+        # Add page marker
+        page_marker = f"\n--- Page {page_num} ---\n"
+        text_parts.append(page_marker)
+        
+        # Analyze spatial layout for hints
+        header_threshold = page_height * 0.15 if page_height else None  # Top 15% is likely header
+        mid_x = page_width / 2 if page_width else None
+        
+        for block_idx, block in enumerate(blocks):
+            block_text = block.get("text", "").strip()
+            if not block_text:
+                continue
+            
+            bbox = block.get("bbox")
+            spatial_hints = []
+            
+            # Add spatial hints if bbox is available
+            if bbox and len(bbox) >= 4:
+                x0, y0, x1, y1 = bbox[0], bbox[1], bbox[2], bbox[3]
+                
+                # Header area hint (top of page)
+                if header_threshold and y0 < header_threshold:
+                    spatial_hints.append("[HEADER_AREA]")
+                
+                # Column hints (for multi-column layouts)
+                if mid_x:
+                    if x1 < mid_x * 0.7:
+                        spatial_hints.append("[LEFT_COLUMN]")
+                    elif x0 > mid_x * 1.3:
+                        spatial_hints.append("[RIGHT_COLUMN]")
+            
+            # Add block marker to preserve structure
+            if spatial_hints:
+                block_marker = " ".join(spatial_hints) + " "
+            else:
+                block_marker = ""
+            
+            # Preserve block boundaries with a subtle marker
+            # (empty line between blocks, but add hint if in header)
+            if block_idx > 0:
+                text_parts.append("")  # Block separator
+            
+            # Add the block text with spatial hints if any
+            if block_marker:
+                # Only add hint once at the start of block
+                lines = block_text.split("\n")
+                if lines:
+                    lines[0] = block_marker + lines[0]
+                    block_text = "\n".join(lines)
+            
+            text_parts.append(block_text)
+        
+        # Page separator (except for last page)
+        if page_idx < len(pages) - 1:
+            text_parts.append("\n")
+    
+    return "\n".join(text_parts).strip()

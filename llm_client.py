@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from jsonschema import validate as jsonschema_validate, ValidationError
 
+from extract_text import extract_readable_text
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -24,111 +26,50 @@ except Exception:
 
 
 class LLMClient:
-    def generate(self, prompt: str, model: str, max_length: int = 2048, system_prompt: Optional[str] = None) -> str:
+    def __init__(self, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None):
+        """
+        Initialize LLM client with system prompt and user prompt template.
+        Both are loaded once at construction time since they never change.
+        """
+        self.system_prompt = ""
+        if system_prompt_path:
+            spath = Path(system_prompt_path)
+            if spath.exists():
+                self.system_prompt = spath.read_text(encoding="utf-8")
+                logger.info(f"Loaded system prompt from: {spath}")
+            else:
+                logger.warning(f"System prompt file not found: {spath}")
+        
+        # Load user prompt template
+        self.user_prompt_template = ""
+        upath = Path(user_prompt_path) if user_prompt_path else Path("user_prompt.txt")
+        if upath.exists():
+            self.user_prompt_template = upath.read_text(encoding="utf-8")
+            logger.info(f"Loaded user prompt template from: {upath}")
+        else:
+            logger.warning(f"User prompt template file not found: {upath}")
+    
+    def generate(self, prompt: str, model: str, max_length: int = 4096) -> str:
+        """
+        Generate text from prompt using the system prompt loaded in constructor.
+        """
         raise NotImplementedError()
-
-    def _extract_readable_text(self, structured: Dict) -> str:
-        """
-        Extract readable text from structured document data while preserving
-        important structural and spatial information that helps the LLM understand
-        document layout and context.
-        
-        Preserves:
-        - Page boundaries
-        - Block structure (groups of related text)
-        - Spatial hints (header area, column layout)
-        - Section markers
-        - Reading order (already in structured data)
-        """
-        pages = structured.get("pages", [])
-        if not pages:
-            return ""
-        
-        text_parts = []
-        for page_idx, page in enumerate(pages):
-            page_num = page.get("page_number", page_idx + 1)
-            page_width = page.get("width")
-            page_height = page.get("height")
-            blocks = page.get("blocks", [])
-            
-            # Add page marker
-            page_marker = f"\n--- Page {page_num} ---\n"
-            text_parts.append(page_marker)
-            
-            # Analyze spatial layout for hints
-            header_threshold = page_height * 0.15 if page_height else None  # Top 15% is likely header
-            mid_x = page_width / 2 if page_width else None
-            
-            for block_idx, block in enumerate(blocks):
-                block_text = block.get("text", "").strip()
-                if not block_text:
-                    continue
-                
-                bbox = block.get("bbox")
-                spatial_hints = []
-                
-                # Add spatial hints if bbox is available
-                if bbox and len(bbox) >= 4:
-                    x0, y0, x1, y1 = bbox[0], bbox[1], bbox[2], bbox[3]
-                    
-                    # Header area hint (top of page)
-                    if header_threshold and y0 < header_threshold:
-                        spatial_hints.append("[HEADER_AREA]")
-                    
-                    # Column hints (for multi-column layouts)
-                    if mid_x:
-                        if x1 < mid_x * 0.7:
-                            spatial_hints.append("[LEFT_COLUMN]")
-                        elif x0 > mid_x * 1.3:
-                            spatial_hints.append("[RIGHT_COLUMN]")
-                
-                # Add block marker to preserve structure
-                if spatial_hints:
-                    block_marker = " ".join(spatial_hints) + " "
-                else:
-                    block_marker = ""
-                
-                # Preserve block boundaries with a subtle marker
-                # (empty line between blocks, but add hint if in header)
-                if block_idx > 0:
-                    text_parts.append("")  # Block separator
-                
-                # Add the block text with spatial hints if any
-                if block_marker:
-                    # Only add hint once at the start of block
-                    lines = block_text.split("\n")
-                    if lines:
-                        lines[0] = block_marker + lines[0]
-                        block_text = "\n".join(lines)
-                
-                text_parts.append(block_text)
-            
-            # Page separator (except for last page)
-            if page_idx < len(pages) - 1:
-                text_parts.append("\n")
-        
-        return "\n".join(text_parts).strip()
 
     def generate_structured(
         self,
         structured: Dict,
-        system_prompt_path: str | Path | None = None,
         schema_path: str | Path | None = None,
         model: str = "ollama/llama2",
-        max_length: int = 2048,
+        max_length: int = 4096,
         max_retries: int = 3,
     ) -> str:
         """
-        Compose a prompt from the system prompt, schema, and structured data,
-        call `generate`, try to parse JSON from the response, validate against
-        the schema (if provided) and retry up to `max_retries` times asking the
-        model to output only valid JSON.
-
+        Extract structured data from CV/resume and convert to JSON using LLM.
+        Uses template-based user prompt with document text and schema injected.
+        
         Returns the final validated JSON string (serialized). Raises on fatal errors.
         """
-        spath = Path(system_prompt_path) if system_prompt_path else None
-        system_prompt = spath.read_text(encoding="utf-8") if spath and spath.exists() else ""
-
+        # Load schema
         schema_text = ""
         schema = None
         if schema_path:
@@ -139,9 +80,11 @@ class LLMClient:
                     schema = json.loads(schema_text)
                 except Exception:
                     schema = None
+            else:
+                logger.warning(f"Schema file not found: {schema_path}")
 
-        # Extract readable text from structured data instead of sending complex JSON
-        document_text = self._extract_readable_text(structured)
+            # Extract readable text from structured data
+            document_text = extract_readable_text(structured)
         logger.info(f"Extracted document text for LLM (length: {len(document_text)} characters)")
         logger.info("=" * 80)
         logger.info("CV TEXT BEING SENT TO LLM:")
@@ -153,47 +96,27 @@ class LLMClient:
             logger.info(document_text)
         logger.info("=" * 80)
         
-        # Compose a clear, structured user prompt
-        user_prompt = f"""Extract and structure the following CV/resume document according to the JSON schema provided.
-
-DOCUMENT TEXT:
-{document_text}
-
-DOCUMENT STRUCTURE HINTS:
-- [HEADER_AREA] markers indicate text in the top portion of the page (typically contains name, contact info)
-- [LEFT_COLUMN] and [RIGHT_COLUMN] markers indicate multi-column layout
-- Page boundaries are marked with "--- Page N ---"
-- Block boundaries are preserved (empty lines between blocks)
-- Text is already in reading order
-
-JSON SCHEMA:
-{schema_text}
-
-INSTRUCTIONS:
-- Extract all information from the document text above
-- Use spatial hints ([HEADER_AREA], column markers) to identify personal_info section
-- Map it to the JSON schema structure exactly
-- Use "YYYY-MM" format for all dates (e.g., "2020-03")
-- For required fields with missing data, use empty strings "" or empty arrays []
-- Output ONLY valid JSON, no markdown, no explanations
-- Ensure all required fields from the schema are present"""
+        # Load user prompt template and replace placeholders with schema and document text
+        if not self.user_prompt_template:
+            raise RuntimeError("User prompt template not loaded. Ensure user_prompt.txt exists or provide user_prompt_path.")
+        
+        user_prompt = self.user_prompt_template.format(
+            DOCUMENT_TEXT=document_text,
+            SCHEMA_TEXT=schema_text
+        )
 
         attempt = 0
         last_error = None
-        last_response = None
         
         logger.info(f"Starting LLM generation (max_retries={max_retries})")
         logger.info(f"Document text length: {len(document_text)} characters")
-        
-        # Initialize prompt variable that will be updated on retries
-        current_user_prompt = user_prompt
-        
+
         while attempt < max_retries:
             attempt += 1
             logger.info(f"Attempt {attempt}/{max_retries} - Calling LLM with model: {model}")
             try:
-                # Simple single call - combine system and user prompts
-                raw = self.generate(current_user_prompt, model=model, max_length=max_length, system_prompt=system_prompt)
+                # Use instance system_prompt (loaded in constructor)
+                raw = self.generate(user_prompt, model=model, max_length=max_length)
                 logger.info(f"Received response (length: {len(raw)} characters)")
                 last_response = raw
             except RuntimeError as e:
@@ -224,7 +147,7 @@ INSTRUCTIONS:
                 logger.warning(f"Attempt {attempt}: Failed to parse JSON from response")
                 if attempt < max_retries:
                     # ask the model to return only corrected JSON on next attempt
-                    current_user_prompt += "\n\nPlease output only a single JSON object that conforms to the provided schema. Do not include any explanatory text."
+                    user_prompt += "\n\nPlease output only a single JSON object that conforms to the provided schema. Do not include any explanatory text."
                     last_error = ValueError(f"LLM did not return valid JSON (attempt {attempt}/{max_retries})")
                     logger.info(f"Retrying with updated prompt...")
                     time.sleep(0.5 * attempt)
@@ -245,7 +168,7 @@ INSTRUCTIONS:
                     error_msg = e.message if hasattr(e, 'message') else str(e)
                     logger.warning(f"Attempt {attempt}: Schema validation failed: {error_msg}")
                     if attempt < max_retries:
-                        current_user_prompt += f"\n\nThe previous JSON did not validate: {error_msg}. Please produce a corrected JSON only."
+                        user_prompt += f"\n\nThe previous JSON did not validate: {error_msg}. Please produce a corrected JSON only."
                         last_error = e
                         logger.info(f"Retrying with validation error feedback...")
                         time.sleep(0.5 * attempt)
@@ -265,14 +188,15 @@ INSTRUCTIONS:
 
 
 class OllamaClient(LLMClient):
-    def __init__(self, url: Optional[str] = None, timeout: int = 60):
+    def __init__(self, url: Optional[str] = None, timeout: int = 60, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None):
+        # Initialize base class with system prompt and user prompt template
+        super().__init__(system_prompt_path=system_prompt_path, user_prompt_path=user_prompt_path)
         # Default local Ollama HTTP API endpoint
         base_url = url or "http://127.0.0.1:11434"
         self.generate_url = f"{base_url}/api/generate"
         self.timeout = timeout
 
-    def generate(self, prompt: str, model: str = "ollama/llama2",
-                 max_length: int = 4096, system_prompt: Optional[str] = None) -> str:
+    def generate(self, prompt: str, model: str = "ollama/llama2", max_length: int = 4096) -> str:
         model_name = model.replace("ollama/", "") if model.startswith("ollama/") else model
 
         body = {
@@ -280,17 +204,19 @@ class OllamaClient(LLMClient):
             "prompt": prompt,               # user content only
             "stream": False,
             "num_predict": max_length,
-            # Use Ollama's native fields instead of concatenating
-            **({"system": system_prompt} if system_prompt else {}),
+            # Use Ollama's native system field (loaded in constructor)
+            **({"system": self.system_prompt} if self.system_prompt else {}),
             # Ask for strict JSON output
             "format": "json",
             # Decoding & context knobs (tune as you like)
             "options": {
                 "temperature": 0,
-                # "num_ctx": 8192,          # raise if your schema + doc are long
-                # "stop": ["```"]           # optional if you ever include markdown in inputs
+                "top_p": 1.0,
+                # "top_k": 1,   # enable if you want fully greedy
+                "seed": 1234,
+                "num_ctx": 8192
             },
-            # "keep_alive": "5m",           # optional: keep model warm between calls
+            # "keep_alive": "5m",  # optional: keep model warm between calls
         }
 
         try:
@@ -309,17 +235,22 @@ class OllamaClient(LLMClient):
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Failed to parse Ollama response as JSON: {e}") from e
 
-def create_llm_client(kind: str = "ollama", **kwargs) -> LLMClient:
+def create_llm_client(kind: str = "ollama", system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None, **kwargs) -> LLMClient:
+    """
+    Create LLM client instance. System prompt and user prompt template are loaded once at construction time.
+    """
     kind = (kind or "ollama").lower()
     if kind == "ollama":
-        return OllamaClient(**kwargs)
+        return OllamaClient(system_prompt_path=system_prompt_path, user_prompt_path=user_prompt_path, **kwargs)
     if kind == "openai":
-        return OpenAIClient(**kwargs)
+        return OpenAIClient(system_prompt_path=system_prompt_path, user_prompt_path=user_prompt_path, **kwargs)
     raise ValueError(f"Unknown LLM client kind: {kind}")
 
 
 class OpenAIClient(LLMClient):
-    def __init__(self, api_key: Optional[str] = None, timeout: int = 60):
+    def __init__(self, api_key: Optional[str] = None, timeout: int = 60, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None):
+        # Initialize base class with system prompt and user prompt template
+        super().__init__(system_prompt_path=system_prompt_path, user_prompt_path=user_prompt_path)
         if openai is None:
             raise RuntimeError("openai package not available")
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
@@ -341,12 +272,12 @@ class OpenAIClient(LLMClient):
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OpenAI client: {e}") from e
 
-    def generate(self, prompt: str, model: str = "gpt-4o-mini", max_length: int = 2048, system_prompt: Optional[str] = None) -> str:
+    def generate(self, prompt: str, model: str = "gpt-4o-mini", max_length: int = 2048) -> str:
         try:
-            # Build messages with system prompt if provided
+            # Build messages with system prompt (loaded in constructor)
             messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
+            if self.system_prompt:
+                messages.append({"role": "system", "content": self.system_prompt})
             messages.append({"role": "user", "content": prompt})
             
             if self.use_client_api:

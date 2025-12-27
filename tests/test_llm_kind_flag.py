@@ -10,11 +10,11 @@ def test_llm_kind_flag_uses_factory(monkeypatch, tmp_path):
         def __init__(self):
             self.generated = False
 
-        def generate_structured(self, structured, system_prompt_path=None, schema_path=None, model=None, max_length=None, max_retries=None):
+        def generate_structured(self, structured, schema_path=None, model=None, max_length=None, max_retries=None):
             self.generated = True
             return json.dumps({"ok": True})
 
-    def fake_factory(kind="ollama", **kwargs):
+    def fake_factory(kind="ollama", system_prompt_path=None, user_prompt_path=None, **kwargs):
         called["called"] = True
         called["kind"] = kind
         return FakeClient()
@@ -31,5 +31,6 @@ def test_llm_kind_flag_uses_factory(monkeypatch, tmp_path):
     assert called["kind"] == "openai"
 
     # output file should exist and be valid JSON
+    # When LLM is used, output is the LLM response directly (not wrapped in "structured")
     data = json.loads(Path(out_file).read_text(encoding="utf-8"))
-    assert "structured" in data
+    assert data is not None

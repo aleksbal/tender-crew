@@ -93,16 +93,15 @@ def main(argv=None):
             
             try:
                 logger.info("Creating LLM client...")
-                client = create_llm_client(kind=args.llm_kind)
+                client = create_llm_client(kind=args.llm_kind, system_prompt_path=args.system_prompt)
                 logger.info(f"LLM client created: {type(client).__name__}")
                 
                 logger.info("Calling LLM to generate structured output...")
                 llm_response = client.generate_structured(
                     redacted_struct,
-                    system_prompt_path=args.system_prompt,
                     schema_path=args.schema,
                     model=args.llm_model,
-                    max_length=2048,
+                    max_length=4096,
                     max_retries=3,
                 )
                 logger.info("LLM processing completed successfully")
