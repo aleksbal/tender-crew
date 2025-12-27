@@ -101,7 +101,7 @@ def extract_text_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
     raise ValueError(f"Unsupported file type: {ext}")
 
 
-def extract_readable_text(structured: Dict) -> str:
+def extract_text_plain(structured: Dict) -> str:
     """
     Chunker-friendly readable text:
     - preserves page boundaries
