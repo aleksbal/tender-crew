@@ -36,6 +36,7 @@ def main(argv=None):
     p.add_argument("path", help="Path to input file (PDF or DOCX)")
     p.add_argument("-o", "--out", help="Output JSON file (default stdout)")
     p.add_argument("--pandoc-ast", action="store_true", help="Export pandoc JSON AST for DOCX (requires pandoc installed)")
+    p.add_argument("--redact", action="store_true", help="Enable PII redaction (default: disabled)")
     p.add_argument("--llm", action="store_true", help="Call local Ollama LLM to post-process structured output")
     p.add_argument("--llm-model", default="ollama/llama2", help="LLM model name for local Ollama")
     p.add_argument("--llm-kind", default="ollama", help="LLM provider kind (ollama|openai)")
@@ -61,9 +62,16 @@ def main(argv=None):
         structured, diag = extract_text_structured(str(work_path))
         logger.info(f"Extracted {len(structured.get('pages', []))} page(s)")
         
-        logger.info("Redacting PII...")
-        redacted_struct, redactions = redact_structured(structured)
-        logger.info(f"Applied {len(redactions)} redaction(s)")
+        # Apply redaction only if --redact flag is set
+        if args.redact:
+            logger.info("Redacting PII using header-based approach...")
+            from redactor import redact_structured_header_only
+            redacted_struct, redactions = redact_structured_header_only(structured)
+            logger.info(f"Applied {len(redactions)} redaction(s) - removed header section")
+        else:
+            logger.info("PII redaction skipped (use --redact to enable)")
+            redacted_struct = structured
+            redactions = []
 
         llm_response = None
         if args.llm:

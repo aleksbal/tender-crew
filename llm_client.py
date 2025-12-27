@@ -142,6 +142,16 @@ class LLMClient:
 
         # Extract readable text from structured data instead of sending complex JSON
         document_text = self._extract_readable_text(structured)
+        logger.info(f"Extracted document text for LLM (length: {len(document_text)} characters)")
+        logger.info("=" * 80)
+        logger.info("CV TEXT BEING SENT TO LLM:")
+        logger.info("=" * 80)
+        # Log the document text (truncate if too long for readability)
+        if len(document_text) > 5000:
+            logger.info(f"{document_text[:5000]}...\n[TRUNCATED - Total length: {len(document_text)} characters]")
+        else:
+            logger.info(document_text)
+        logger.info("=" * 80)
         
         # Compose a clear, structured user prompt
         user_prompt = f"""Extract and structure the following CV/resume document according to the JSON schema provided.
@@ -261,36 +271,35 @@ class OllamaClient(LLMClient):
         self.generate_url = f"{base_url}/api/generate"
         self.timeout = timeout
 
-    def generate(self, prompt: str, model: str = "ollama/llama2", max_length: int = 2048, system_prompt: Optional[str] = None) -> str:
-        # Remove "ollama/" prefix if present (Ollama uses just model name)
+    def generate(self, prompt: str, model: str = "ollama/llama2",
+                 max_length: int = 4096, system_prompt: Optional[str] = None) -> str:
         model_name = model.replace("ollama/", "") if model.startswith("ollama/") else model
-        
-        # Combine system prompt and user prompt if system prompt is provided
-        if system_prompt:
-            full_prompt = f"{system_prompt}\n\n{prompt}"
-        else:
-            full_prompt = prompt
-        
+
         body = {
             "model": model_name,
-            "prompt": full_prompt,
-            "stream": False,  # Disable streaming - we want complete response
+            "prompt": prompt,               # user content only
+            "stream": False,
             "num_predict": max_length,
+            # Use Ollama's native fields instead of concatenating
+            **({"system": system_prompt} if system_prompt else {}),
+            # Ask for strict JSON output
+            "format": "json",
+            # Decoding & context knobs (tune as you like)
+            "options": {
+                "temperature": 0,
+                # "num_ctx": 8192,          # raise if your schema + doc are long
+                # "stop": ["```"]           # optional if you ever include markdown in inputs
+            },
+            # "keep_alive": "5m",           # optional: keep model warm between calls
         }
-        
+
         try:
             resp = requests.post(self.generate_url, json=body, timeout=self.timeout)
             resp.raise_for_status()
-            
-            # Parse the JSON response
-            response_data = resp.json()
-            
-            # Ollama returns {"response": "...", "done": true, ...}
-            if "response" in response_data:
-                return response_data["response"]
-            else:
-                raise ValueError(f"Unexpected Ollama response format: {list(response_data.keys())}")
-                
+            data = resp.json()
+            if "response" in data:
+                return data["response"]
+            raise ValueError(f"Unexpected Ollama response format: {list(data.keys())}")
         except requests.exceptions.ConnectionError as e:
             raise RuntimeError(f"Failed to connect to Ollama server at {self.generate_url}. Is Ollama running?") from e
         except requests.exceptions.Timeout as e:
@@ -299,7 +308,6 @@ class OllamaClient(LLMClient):
             raise RuntimeError(f"Ollama API error: {e.response.status_code} - {e.response.text}") from e
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Failed to parse Ollama response as JSON: {e}") from e
-
 
 def create_llm_client(kind: str = "ollama", **kwargs) -> LLMClient:
     kind = (kind or "ollama").lower()

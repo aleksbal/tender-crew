@@ -1,6 +1,9 @@
 import re
+import logging
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
@@ -30,6 +33,20 @@ ADDRESS_LABEL_RE = re.compile(r"^\s*(adresse|anschrift|address)\s*[:\-]", re.IGN
 
 SECTION_HEADER_RE = re.compile(
     r"^\s*(experience|work history|employment|berufserfahrung|projects|projekte|skills|fähigkeiten|education|ausbildung|profil|summary|zusammenfassung)\s*$",
+    re.IGNORECASE,
+)
+
+# Extended list of section headers that indicate content start (not PII)
+CONTENT_START_SECTIONS = re.compile(
+    r"^\s*(##\s*)?(profil|zusammenfassung|summary|about|über mich|"
+    r"berufserfahrung|erfahrung|experience|work history|employment|karriere|"
+    r"projekte|projects|project experience|"
+    r"skills|kenntnisse|fähigkeiten|qualifikationen|competencies|"
+    r"ausbildung|education|bildung|qualifikation|"
+    r"zertifikate|certificates|certifications|"
+    r"sprachen|languages|"
+    r"technologien|technologies|tools|"
+    r"interessen|interests)\s*$",
     re.IGNORECASE,
 )
 
@@ -326,4 +343,126 @@ def redact_structured(structured: Dict, max_header_lines: int = 20) -> Tuple[Dic
                 offset = ln_end + 1
             offset += 1
 
+    return structured, redactions
+
+
+def redact_structured_header_only(structured: Dict, max_header_lines: int = 30) -> Tuple[Dict, List[Dict[str, Any]]]:
+    """
+    Simple header-based redaction: removes everything from the start until the first
+    content section (Summary, Experience, Projects, etc.). This is more reliable than
+    regex-based PII detection and less likely to break important data.
+    
+    Strategy:
+    1. Find the first section header that indicates content start (not PII)
+    2. Remove everything before that section (including the header itself)
+    3. If no section found, remove first N lines as fallback
+    
+    Returns (redacted_structured, redactions_list)
+    """
+    redactions: List[Dict[str, Any]] = []
+    pages = structured.get("pages", [])
+    
+    if not pages:
+        return structured, redactions
+    
+    # Process first page to find where content starts
+    first_page = pages[0]
+    blocks = first_page.get("blocks", [])
+    
+    if not blocks:
+        return structured, redactions
+    
+    # Find the first block that contains a content section header
+    content_start_block_idx = None
+    content_start_line_idx = None
+    
+    for block_idx, block in enumerate(blocks):
+        lines = block.get("lines", [])
+        for line_idx, line in enumerate(lines):
+            line_text = line.get("text", "").strip()
+            # Remove markdown heading markers if present
+            line_text_clean = re.sub(r"^##\s*", "", line_text)
+            # Check if this line is a content section header
+            if CONTENT_START_SECTIONS.match(line_text_clean):
+                content_start_block_idx = block_idx
+                content_start_line_idx = line_idx
+                break
+        if content_start_block_idx is not None:
+            break
+    
+    # If we found a content section, remove everything before it
+    if content_start_block_idx is not None:
+        # Remove blocks before the content start block
+        removed_blocks = blocks[:content_start_block_idx]
+        for block in removed_blocks:
+            block_text = block.get("text", "")
+            redactions.append({
+                "kind": "header_removal",
+                "original": block_text,
+                "replacement": "",
+                "page": 0,
+                "block": blocks.index(block),
+                "line": None,
+            })
+        
+        # Keep only blocks from content start onwards
+        remaining_blocks = blocks[content_start_block_idx:]
+        
+        # If we found the section in a specific line, we might want to keep that line
+        # but for simplicity, we'll keep the entire block (the section header is useful context)
+        first_page["blocks"] = remaining_blocks
+        
+        # Recompute page_text from remaining blocks
+        page_text_parts = []
+        for block in remaining_blocks:
+            line_texts = [ln.get("text", "") for ln in block.get("lines", [])]
+            block_text = "\n".join(line_texts)
+            block["text"] = block_text
+            page_text_parts.append(block_text)
+        
+        first_page["page_text"] = "\n\n".join(page_text_parts)
+        
+        # Recompute line character positions
+        offset = 0
+        for block in remaining_blocks:
+            for line in block.get("lines", []):
+                txt = line.get("text", "")
+                line["char_start"] = offset
+                line["char_end"] = offset + len(txt)
+                offset = line["char_end"] + 1  # newline
+            offset += 1  # block separator
+        
+        logger.info(f"Header redaction: Removed {len(removed_blocks)} blocks before content section")
+    else:
+        # Fallback: remove first N lines from first page if no section header found
+        logger.warning("No content section header found, using fallback: removing first lines")
+        if blocks:
+            first_block = blocks[0]
+            lines = first_block.get("lines", [])
+            if lines:
+                # Remove first few lines (typically name, address, etc.)
+                lines_to_remove = min(max_header_lines, len(lines))
+                removed_lines = lines[:lines_to_remove]
+                
+                for line in removed_lines:
+                    redactions.append({
+                        "kind": "header_removal",
+                        "original": line.get("text", ""),
+                        "replacement": "",
+                        "page": 0,
+                        "block": 0,
+                        "line": lines.index(line),
+                    })
+                
+                first_block["lines"] = lines[lines_to_remove:]
+                
+                # Recompute block text
+                first_block["text"] = "\n".join([ln.get("text", "") for ln in first_block["lines"]])
+                
+                # Recompute page text
+                page_text_parts = []
+                for block in blocks:
+                    page_text_parts.append(block.get("text", ""))
+                first_page["page_text"] = "\n\n".join(page_text_parts)
+    
     return structured, redactions
