@@ -48,6 +48,4 @@ def convert_input(path: str, *, pandoc_ast: bool = False):
             except Exception:
                 pandoc_ast = None
 
-    # OCR is intentionally unsupported in this project; expect searchable PDF/DOCX inputs.
-
     return {"work_path": work_path, "tmp_files": tmp_files, "pandoc_ast": pandoc_ast}

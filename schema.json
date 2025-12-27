@@ -80,6 +80,11 @@
           "description": {
             "type": "string",
             "description": "Responsibilities, impact, achievements. Keep concise but informative."
+          },
+          "technologies": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Programming languages, frameworks, tools, platforms (e.g., Spring Boot, Docker, AWS)."
           }
         }
       }
@@ -117,7 +122,7 @@
         "technologies": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Frameworks, tools, platforms (e.g., Spring Boot, Docker, AWS)."
+          "description": "Frameworks, tools, platforms Programming languages, frameworks, tools, platforms (e.g., Java, Python, AWS, Spring Boot, NodeJS, JS, Docker etc.)."
         },
         "soft_skills": {
           "type": "array",
@@ -154,6 +159,11 @@
           "industry":   { "type": "string", "description": "e.g., Finance, Healthcare, Retail." },
           "role":       { "type": "string", "description": "Short title for the project role (e.g., Lead Engineer)." },
           "role_description": { "type": "string", "description": "What was done on this project, outcomes, scope." },
+          "technologies": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Programming languages, frameworks, tools, platforms (e.g., Java, Python, AWS, Spring Boot, NodeJS, JS, Docker etc.)."
+          },
           "tools_and_frameworks": {
             "type": "array",
             "description": "Breakdown of effort per tool. Integers must sum to 100 across this array.",

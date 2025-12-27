@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Dict, Optional
 
 import fitz  # pymupdf
 from docx import Document
@@ -12,47 +12,148 @@ from docx.text.paragraph import Paragraph
 from docx.table import Table
 
 
+# =============================================================================
+# Diagnostics
+# =============================================================================
+
 @dataclass
 class ExtractDiagnostics:
     file_type: str
     pages: int = 0
     rejected_scanned_pdf: bool = False
-    multi_column_pages: int = 0
+    multi_column_pages: int = 0  # kept for compatibility (no longer used by words-extraction)
     empty_text_pages: int = 0
 
 
+# =============================================================================
+# Section-ish headings (optional; used only when normalizing DOCX / legacy blocks)
+# =============================================================================
+
 SECTIONY_RE = re.compile(
-    r"^\s*(profil|zusammenfassung|skills|kenntnisse|technologien|"
-    r"berufserfahrung|erfahrung|projekte|ausbildung|zertifikate|sprachen|"
-    r"experience|projects|education|certificates|languages)\s*$",
-    re.IGNORECASE,
+    r"""
+    ^
+    \s*
+    (?:                                   # any heading containing…
+        .*?\b(
+            profil|
+            zusammenfassung|
+            kurzprofil|
+            beruf|
+            werdegang|
+            erfahrung|
+            projekt|
+            tätigkeit|
+            skills?|
+            kenntnisse|
+            technologien?|
+            stack|
+            education|
+            ausbildung|
+            certificates?|
+            zertifikate|
+            languages?|
+            sprachen
+        )\b.*?
+    )
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
+FOOTER_RE = re.compile(r"^\s*Lebenslauf\b.*\bSeite\s+\d+\s*$", re.IGNORECASE)
+
+
+# =============================================================================
+# Public API
+# =============================================================================
 
 def extract_text(path: str) -> Tuple[str, ExtractDiagnostics]:
+    """
+    Simple API: return readable text + diagnostics.
+    - DOCX: paragraphs + tables
+    - PDF: WORDS -> lines -> per-page text (robust for CV layouts)
+    """
     ext = os.path.splitext(path.lower())[1]
     if ext == ".docx":
         text = _docx_to_text(path)
         return text, ExtractDiagnostics(file_type="docx", pages=1)
+
     if ext == ".pdf":
-        text, diag = _pdf_to_text_markdownish(path)
+        text, diag = _pdf_to_text_words(path)
         return text, diag
+
     raise ValueError(f"Unsupported file type: {ext}")
 
 
-# ---------------- DOCX ----------------
+def extract_text_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
+    """
+    Structured API: returns dict with pages->blocks.
+    IMPORTANT: For PDFs we do NOT use get_text('blocks') anymore.
+               We use WORDS->LINES to preserve reading order and prevent missing anchors.
+    """
+    ext = os.path.splitext(path.lower())[1]
+    if ext == ".pdf":
+        return _pdf_to_structured_words(path)
+    if ext == ".docx":
+        return _docx_to_structured(path)
+    raise ValueError(f"Unsupported file type: {ext}")
+
+
+def extract_readable_text(structured: Dict) -> str:
+    """
+    Chunker-friendly readable text:
+    - preserves page boundaries
+    - preserves block boundaries (blank line between blocks)
+    - DOES NOT invent [LEFT_COLUMN]/[RIGHT_COLUMN]/[HEADER_AREA]
+    - removes obvious footers (Lebenslauf … Seite N)
+    """
+    pages = structured.get("pages", [])
+    if not pages:
+        return ""
+
+    parts: List[str] = []
+    for page_idx, page in enumerate(pages):
+        page_num = page.get("page_number", page_idx + 1)
+        parts.append(f"\n--- Page {page_num} ---\n")
+
+        blocks = page.get("blocks", []) or []
+        for block in blocks:
+            block_text = (block.get("text") or "").strip()
+            if not block_text:
+                continue
+
+            # remove footer lines inside blocks
+            lines: List[str] = []
+            for ln in block_text.splitlines():
+                s = ln.strip()
+                if not s:
+                    continue
+                if FOOTER_RE.match(s):
+                    continue
+                lines.append(s)
+
+            if not lines:
+                continue
+
+            parts.append("\n".join(lines))
+            parts.append("")  # blank line between blocks
+
+    return "\n".join(parts).strip() + "\n"
+
+
+# =============================================================================
+# DOCX
+# =============================================================================
 
 def _docx_to_text(path: str) -> str:
     doc = Document(path)
     lines: List[str] = []
 
-    # Paragraphs (keeps bullets as plain text; good enough for LLM extraction)
     for p in doc.paragraphs:
         t = (p.text or "").strip()
         if t:
             lines.append(t)
 
-    # Tables → flatten rows
     for table in doc.tables:
         for row in table.rows:
             cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
@@ -62,128 +163,64 @@ def _docx_to_text(path: str) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-# ---------------- PDF ----------------
+def _docx_to_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
+    doc = Document(path)
+    pages_blocks: List[List[Dict]] = [[]]
 
-def _pdf_to_text_markdownish(path: str) -> Tuple[str, ExtractDiagnostics]:
-    doc = fitz.open(path)
-    diag = ExtractDiagnostics(file_type="pdf", pages=doc.page_count)
-    out_lines: List[str] = []
+    def para_has_page_break(par: Paragraph) -> bool:
+        for r in par.runs:
+            for br in r._r.findall(qn('w:br')):
+                if br.get(qn('w:type')) == 'page':
+                    return True
+        if 'lastRenderedPageBreak' in par._p.xml:
+            return True
+        return False
 
-    for pno in range(doc.page_count):
-        page = doc.load_page(pno)
+    body = doc.element.body
+    for child in body:
+        if child.tag == qn('w:p'):
+            p = Paragraph(child, doc)
+            t = (p.text or '').strip()
+            if t:
+                norm_lines = _normalize_block(t)
+                pages_blocks[-1].append({
+                    'bbox': None,
+                    'text': '\n'.join(norm_lines),
+                    'lines': [{'text': ln, 'char_start': None, 'char_end': None} for ln in norm_lines],
+                })
+            if para_has_page_break(p):
+                pages_blocks.append([])
+        elif child.tag == qn('w:tbl'):
+            tbl = Table(child, doc)
+            for row in tbl.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    t = ' | '.join(cells)
+                    norm_lines = _normalize_block(t)
+                    pages_blocks[-1].append({
+                        'bbox': None,
+                        'text': '\n'.join(norm_lines),
+                        'lines': [{'text': ln, 'char_start': None, 'char_end': None} for ln in norm_lines],
+                    })
 
-        blocks = page.get_text("blocks")  # (x0, y0, x1, y1, "text", block_no, block_type)
-        # Keep only text blocks with some content
-        text_blocks = [
-            (x0, y0, x1, y1, txt)
-            for (x0, y0, x1, y1, txt, *_rest) in blocks
-            if isinstance(txt, str) and txt.strip()
-        ]
+    pages_out: List[Dict] = []
+    for pi, blocks_out in enumerate(pages_blocks):
+        if not blocks_out and pi == len(pages_blocks) - 1:
+            continue
+        page_text = '\n\n'.join(b['text'] for b in blocks_out)
+        pages_out.append({
+            'page_number': pi + 1,
+            'width': None,
+            'height': None,
+            'page_text': page_text,
+            'blocks': blocks_out,
+        })
 
-        if not text_blocks:
-            # No selectable text -> likely scanned or weird embedded images → reject by your policy
-            diag.rejected_scanned_pdf = True
-            diag.empty_text_pages += 1
-            raise ValueError(
-                f"PDF page {pno+1} has no extractable text (scanned/bitmap?). Rejecting by policy."
-            )
-
-        # Decide whether page is likely multi-column
-        is_multi = _is_likely_two_column(text_blocks, page_width=page.rect.width)
-        if is_multi:
-            diag.multi_column_pages += 1
-
-        out_lines.append(f"# Page {pno+1}")
-        out_lines.append("")  # blank
-
-        # Order blocks into reading order (single or two-column)
-        ordered_texts = _order_blocks_reading_order(text_blocks, two_column=is_multi, page_width=page.rect.width)
-
-        # Light cleanup + add structure cues
-        out_lines.extend(_normalize_block_texts(ordered_texts))
-        out_lines.append("")  # page break spacer
-        out_lines.append("---")
-        out_lines.append("")
-
-    return "\n".join(out_lines).strip() + "\n", diag
-
-
-def _is_likely_two_column(text_blocks: List[Tuple[float, float, float, float, str]], page_width: float) -> bool:
-    """
-    Simple heuristic:
-    - compute block centers; if many blocks cluster clearly into left/right halves,
-      treat as two-column.
-    """
-    centers = [(x0 + x1) / 2 for (x0, _y0, x1, _y1, _t) in text_blocks]
-    mid = page_width / 2
-
-    left = sum(1 for c in centers if c < mid * 0.95)
-    right = sum(1 for c in centers if c > mid * 1.05)
-
-    # require both sides to have enough blocks
-    total = len(centers)
-    return left >= max(4, total * 0.25) and right >= max(4, total * 0.25)
-
-
-def _order_blocks_reading_order(
-    text_blocks: List[Tuple[float, float, float, float, str]],
-    two_column: bool,
-    page_width: float,
-) -> List[str]:
-    """
-    For single-column:
-      sort by y0 then x0
-    For two-column:
-      split into left/right by x center, sort each by y0, then left column first, then right.
-    """
-    if not two_column:
-        blocks_sorted = sorted(text_blocks, key=lambda b: (b[1], b[0]))  # y0, x0
-        return [b[4] for b in blocks_sorted]
-
-    mid = page_width / 2
-    left_blocks = []
-    right_blocks = []
-    for (x0, y0, x1, y1, t) in text_blocks:
-        cx = (x0 + x1) / 2
-        if cx <= mid:
-            left_blocks.append((x0, y0, x1, y1, t))
-        else:
-            right_blocks.append((x0, y0, x1, y1, t))
-
-    left_sorted = sorted(left_blocks, key=lambda b: (b[1], b[0]))
-    right_sorted = sorted(right_blocks, key=lambda b: (b[1], b[0]))
-
-    return [b[4] for b in left_sorted] + [b[4] for b in right_sorted]
-
-
-def _normalize_block_texts(block_texts: List[str]) -> List[str]:
-    """
-    Turn blocks into lines, preserve bullets, add blank lines between logical segments.
-    Adds lightweight heading markers if a line looks like a section title.
-    """
-    out: List[str] = []
-    for block in block_texts:
-        # split to lines, strip excessive whitespace
-        lines = [re.sub(r"\s+", " ", ln).strip() for ln in block.splitlines()]
-        lines = [ln for ln in lines if ln]
-
-        for ln in lines:
-            # Promote obvious section headers
-            if SECTIONY_RE.match(ln):
-                out.append(f"## {ln}")
-            else:
-                out.append(ln)
-
-        # spacer between blocks
-        out.append("")
-    return out
+    diag = ExtractDiagnostics(file_type='docx', pages=len(pages_out))
+    return {'file_type': 'docx', 'pages': pages_out}, diag
 
 
 def _normalize_block(block: str) -> List[str]:
-    """
-    Normalize a single text block into a list of lines (preserves bullets,
-    promotes section-like lines to '## ' headings) — used for structured output.
-    """
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in block.splitlines()]
     lines = [ln for ln in lines if ln]
     out: List[str] = []
@@ -195,41 +232,49 @@ def _normalize_block(block: str) -> List[str]:
     return out
 
 
-def _order_blocks_reading_order_blocks(
-    text_blocks: List[Tuple[float, float, float, float, str]],
-    two_column: bool,
-    page_width: float,
-) -> List[Tuple[float, float, float, float, str]]:
+# =============================================================================
+# PDF (FIXED): WORDS -> LINES (for both readable and structured)
+# =============================================================================
+
+def _pdf_to_text_words(path: str) -> Tuple[str, ExtractDiagnostics]:
     """
-    Like `_order_blocks_reading_order` but returns the full block tuples
-    including their bboxes so callers can emit structured output with bboxes.
+    Robust PDF -> text:
+    - Extract WORDS (not blocks)
+    - Reconstruct LINES by y clustering
+    - Sort words left->right within each line
+    - Keep EVERYTHING (don’t drop header/right here)
     """
-    if not two_column:
-        blocks_sorted = sorted(text_blocks, key=lambda b: (b[1], b[0]))  # y0, x0
-        return blocks_sorted
+    doc = fitz.open(path)
+    diag = ExtractDiagnostics(file_type="pdf", pages=doc.page_count)
+    out_lines: List[str] = []
 
-    mid = page_width / 2
-    left_blocks = []
-    right_blocks = []
-    for (x0, y0, x1, y1, t) in text_blocks:
-        cx = (x0 + x1) / 2
-        if cx <= mid:
-            left_blocks.append((x0, y0, x1, y1, t))
-        else:
-            right_blocks.append((x0, y0, x1, y1, t))
+    for pno in range(doc.page_count):
+        page = doc.load_page(pno)
+        words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,wordno)
 
-    left_sorted = sorted(left_blocks, key=lambda b: (b[1], b[0]))
-    right_sorted = sorted(right_blocks, key=lambda b: (b[1], b[0]))
+        if not words:
+            diag.rejected_scanned_pdf = True
+            diag.empty_text_pages += 1
+            raise ValueError(
+                f"PDF page {pno+1} has no extractable text (scanned/bitmap?). Rejecting by policy."
+            )
 
-    return left_sorted + right_sorted
+        lines = _words_to_lines(words)
+
+        out_lines.append(f"--- Page {pno+1} ---")
+        out_lines.append("")
+        out_lines.extend(lines)
+        out_lines.append("")
+        out_lines.append("")  # spacer
+
+    return "\n".join(out_lines).strip() + "\n", diag
 
 
-def _pdf_to_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
+def _pdf_to_structured_words(path: str) -> Tuple[Dict, ExtractDiagnostics]:
     """
-    Produce structured JSON-like dict for a PDF:
-      { file_type: 'pdf', pages: [ { page_number, width, height, page_text, blocks: [ {bbox, text, lines:[{text,char_start,char_end}] } ] } ] }
-
-    Returns (structured_dict, diagnostics).
+    Structured PDF extraction (WORDS->LINES):
+    Produces blocks that are essentially reconstructed lines (or small line groups),
+    with bboxes. This preserves the anchor dates far better than get_text("blocks").
     """
     doc = fitz.open(path)
     diag = ExtractDiagnostics(file_type="pdf", pages=doc.page_count)
@@ -237,60 +282,47 @@ def _pdf_to_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
 
     for pno in range(doc.page_count):
         page = doc.load_page(pno)
+        words = page.get_text("words")
 
-        blocks = page.get_text("blocks")
-        text_blocks = [
-            (x0, y0, x1, y1, txt)
-            for (x0, y0, x1, y1, txt, *_rest) in blocks
-            if isinstance(txt, str) and txt.strip()
-        ]
-
-        if not text_blocks:
+        if not words:
             diag.rejected_scanned_pdf = True
             diag.empty_text_pages += 1
             raise ValueError(
                 f"PDF page {pno+1} has no extractable text (scanned/bitmap?). Rejecting by policy."
             )
 
-        is_multi = _is_likely_two_column(text_blocks, page_width=page.rect.width)
-        if is_multi:
-            diag.multi_column_pages += 1
+        line_objs = _words_to_line_objects(words)
 
-        ordered_blocks = _order_blocks_reading_order_blocks(text_blocks, two_column=is_multi, page_width=page.rect.width)
-
-        page_text = ""
         blocks_out: List[Dict] = []
+        page_text_parts: List[str] = []
+        abs_pos = 0
 
-        for (x0, y0, x1, y1, txt) in ordered_blocks:
-            norm_lines = _normalize_block(txt)
-            block_text = "\n".join(norm_lines)
+        for ln in line_objs:
+            text = ln["text"].strip()
+            if not text:
+                continue
 
-            if page_text:
-                sep = "\n\n"
-                abs_block_start = len(page_text) + len(sep)
-                page_text = page_text + sep + block_text
-            else:
-                abs_block_start = 0
-                page_text = block_text
+            # optional footer kill right here (helps both structured & readable)
+            if FOOTER_RE.match(text):
+                continue
 
-            # compute per-line spans relative to page_text
-            line_spans: List[Dict] = []
-            pos = 0
-            for i, ln in enumerate(norm_lines):
-                ln_start = pos
-                ln_end = ln_start + len(ln)
-                line_spans.append({
-                    "text": ln,
-                    "char_start": abs_block_start + ln_start,
-                    "char_end": abs_block_start + ln_end,
-                })
-                pos = ln_end + 1  # account for the '\n' between lines in block_text
+            # In structured view, each reconstructed line is a block
+            block_text = text
+            # char spans inside page_text (simple: whole line)
+            char_start = abs_pos
+            char_end = char_start + len(block_text)
 
             blocks_out.append({
-                "bbox": [x0, y0, x1, y1],
+                "bbox": ln["bbox"],
                 "text": block_text,
-                "lines": line_spans,
+                "lines": [{"text": block_text, "char_start": char_start, "char_end": char_end}],
             })
+
+            page_text_parts.append(block_text)
+            # account for separator "\n\n" between blocks
+            abs_pos = char_end + 2
+
+        page_text = "\n\n".join(page_text_parts)
 
         pages_out.append({
             "page_number": pno + 1,
@@ -303,160 +335,123 @@ def _pdf_to_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
     return {"file_type": "pdf", "pages": pages_out}, diag
 
 
-def extract_text_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
+def _words_to_lines(words) -> List[str]:
     """
-    New API: return a structured representation (dict) and diagnostics for a file.
-    For PDFs returns the full pages→blocks→lines structure; for DOCX returns a single-page representation
-    with paragraph/table blocks.
+    Convert PyMuPDF words list into human-readable text lines.
+    - sort by y0 then x0
+    - cluster words into same line if y0 within tolerance
+    - within a line, sort by x0 and join (gap-based)
     """
-    ext = os.path.splitext(path.lower())[1]
-    if ext == ".pdf":
-        return _pdf_to_structured(path)
-    if ext == ".docx":
-        # Build a structured view for DOCX, respecting explicit page breaks
-        doc = Document(path)
-        pages_blocks: List[List[Dict]] = [[]]
+    words_sorted = sorted(words, key=lambda w: (w[1], w[0]))
+    Y_TOL = 2.5
 
-        def para_has_page_break(par: Paragraph) -> bool:
-            # Look for run-level page break elements
-            for r in par.runs:
-                for br in r._r.findall(qn('w:br')):
-                    # check w:type attribute == 'page'
-                    if br.get(qn('w:type')) == 'page':
-                        return True
-            # also look for explicit lastRenderedPageBreak in paragraph xml
-            if 'lastRenderedPageBreak' in par._p.xml:
-                return True
-            return False
+    lines_out: List[str] = []
+    cur_line: List[tuple] = []
+    cur_y: Optional[float] = None
 
-        # Iterate document body children to preserve order (paragraphs + tables)
-        body = doc.element.body
-        for child in body:
-            if child.tag == qn('w:p'):
-                p = Paragraph(child, doc)
-                t = (p.text or '').strip()
-                if t:
-                    norm_lines = _normalize_block(t)
-                    pages_blocks[-1].append({
-                        'bbox': None,
-                        'text': '\n'.join(norm_lines),
-                        'lines': [{'text': ln, 'char_start': None, 'char_end': None} for ln in norm_lines],
-                    })
-                if para_has_page_break(p):
-                    pages_blocks.append([])
-            elif child.tag == qn('w:tbl'):
-                tbl = Table(child, doc)
-                # Flatten rows
-                for row in tbl.rows:
-                    cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
-                    if cells:
-                        t = ' | '.join(cells)
-                        norm_lines = _normalize_block(t)
-                        pages_blocks[-1].append({
-                            'bbox': None,
-                            'text': '\n'.join(norm_lines),
-                            'lines': [{'text': ln, 'char_start': None, 'char_end': None} for ln in norm_lines],
-                        })
+    def flush_line():
+        nonlocal cur_line
+        if not cur_line:
+            return
+        cur_line.sort(key=lambda w: w[0])  # x0
 
-        # Build pages output
-        pages_out: List[Dict] = []
-        for pi, blocks_out in enumerate(pages_blocks):
-            # skip empty trailing pages
-            if not blocks_out and pi == len(pages_blocks) - 1:
+        parts: List[str] = []
+        prev_x1 = None
+        for (x0, y0, x1, y1, text, *_rest) in cur_line:
+            t = re.sub(r"\s+", " ", (text or "").strip())
+            if not t:
                 continue
-            page_text = '\n\n'.join(b['text'] for b in blocks_out)
-            pages_out.append({
-                'page_number': pi + 1,
-                'width': None,
-                'height': None,
-                'page_text': page_text,
-                'blocks': blocks_out,
-            })
-
-        diag = ExtractDiagnostics(file_type='docx', pages=len(pages_out))
-        return {'file_type': 'docx', 'pages': pages_out}, diag
-
-    raise ValueError(f"Unsupported file type: {ext}")
-
-
-def extract_readable_text(structured: Dict) -> str:
-    """
-    Extract readable text from structured document data while preserving
-    important structural and spatial information that helps the LLM understand
-    document layout and context.
-    
-    Preserves:
-    - Page boundaries
-    - Block structure (groups of related text)
-    - Spatial hints (header area, column layout)
-    - Section markers
-    - Reading order (already in structured data)
-    """
-    pages = structured.get("pages", [])
-    if not pages:
-        return ""
-    
-    text_parts = []
-    for page_idx, page in enumerate(pages):
-        page_num = page.get("page_number", page_idx + 1)
-        page_width = page.get("width")
-        page_height = page.get("height")
-        blocks = page.get("blocks", [])
-        
-        # Add page marker
-        page_marker = f"\n--- Page {page_num} ---\n"
-        text_parts.append(page_marker)
-        
-        # Analyze spatial layout for hints
-        header_threshold = page_height * 0.15 if page_height else None  # Top 15% is likely header
-        mid_x = page_width / 2 if page_width else None
-        
-        for block_idx, block in enumerate(blocks):
-            block_text = block.get("text", "").strip()
-            if not block_text:
-                continue
-            
-            bbox = block.get("bbox")
-            spatial_hints = []
-            
-            # Add spatial hints if bbox is available
-            if bbox and len(bbox) >= 4:
-                x0, y0, x1, y1 = bbox[0], bbox[1], bbox[2], bbox[3]
-                
-                # Header area hint (top of page)
-                if header_threshold and y0 < header_threshold:
-                    spatial_hints.append("[HEADER_AREA]")
-                
-                # Column hints (for multi-column layouts)
-                if mid_x:
-                    if x1 < mid_x * 0.7:
-                        spatial_hints.append("[LEFT_COLUMN]")
-                    elif x0 > mid_x * 1.3:
-                        spatial_hints.append("[RIGHT_COLUMN]")
-            
-            # Add block marker to preserve structure
-            if spatial_hints:
-                block_marker = " ".join(spatial_hints) + " "
+            if prev_x1 is None:
+                parts.append(t)
             else:
-                block_marker = ""
-            
-            # Preserve block boundaries with a subtle marker
-            # (empty line between blocks, but add hint if in header)
-            if block_idx > 0:
-                text_parts.append("")  # Block separator
-            
-            # Add the block text with spatial hints if any
-            if block_marker:
-                # Only add hint once at the start of block
-                lines = block_text.split("\n")
-                if lines:
-                    lines[0] = block_marker + lines[0]
-                    block_text = "\n".join(lines)
-            
-            text_parts.append(block_text)
-        
-        # Page separator (except for last page)
-        if page_idx < len(pages) - 1:
-            text_parts.append("\n")
-    
-    return "\n".join(text_parts).strip()
+                gap = x0 - prev_x1
+                parts.append((" " if gap > 1.5 else "") + t)
+            prev_x1 = x1
+
+        line_text = "".join(parts).strip()
+        if line_text:
+            lines_out.append(line_text)
+
+        cur_line = []
+
+    for w in words_sorted:
+        x0, y0, x1, y1, text, *_ = w
+        if cur_y is None:
+            cur_y = y0
+            cur_line.append(w)
+            continue
+        if abs(y0 - cur_y) <= Y_TOL:
+            cur_line.append(w)
+        else:
+            flush_line()
+            cur_y = y0
+            cur_line.append(w)
+
+    flush_line()
+    return lines_out
+
+
+def _words_to_line_objects(words) -> List[Dict]:
+    """
+    Like _words_to_lines but returns:
+      [{"bbox":[x0,y0,x1,y1], "text":"..."}]
+    """
+    words_sorted = sorted(words, key=lambda w: (w[1], w[0]))
+    Y_TOL = 2.5
+
+    out: List[Dict] = []
+    cur: List[tuple] = []
+    cur_y: Optional[float] = None
+
+    def flush():
+        nonlocal cur
+        if not cur:
+            return
+        cur.sort(key=lambda w: w[0])  # x0
+
+        parts: List[str] = []
+        prev_x1 = None
+
+        min_x0 = float("inf")
+        min_y0 = float("inf")
+        max_x1 = float("-inf")
+        max_y1 = float("-inf")
+
+        for (x0, y0, x1, y1, text, *_rest) in cur:
+            min_x0 = min(min_x0, x0)
+            min_y0 = min(min_y0, y0)
+            max_x1 = max(max_x1, x1)
+            max_y1 = max(max_y1, y1)
+
+            t = re.sub(r"\s+", " ", (text or "").strip())
+            if not t:
+                continue
+            if prev_x1 is None:
+                parts.append(t)
+            else:
+                gap = x0 - prev_x1
+                parts.append((" " if gap > 1.5 else "") + t)
+            prev_x1 = x1
+
+        line_text = "".join(parts).strip()
+        if line_text:
+            out.append({"bbox": [min_x0, min_y0, max_x1, max_y1], "text": line_text})
+
+        cur = []
+
+    for w in words_sorted:
+        x0, y0, x1, y1, text, *_ = w
+        if cur_y is None:
+            cur_y = y0
+            cur.append(w)
+            continue
+        if abs(y0 - cur_y) <= Y_TOL:
+            cur.append(w)
+        else:
+            flush()
+            cur_y = y0
+            cur.append(w)
+
+    flush()
+    return out
+

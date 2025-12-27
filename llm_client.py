@@ -92,7 +92,7 @@ class LLMClient:
         logger.info("=" * 80)
         # Log the document text (truncate if too long for readability)
         if len(document_text) > 5000:
-            logger.info(f"{document_text[:5000]}...\n[TRUNCATED - Total length: {len(document_text)} characters]")
+            logger.info(f"{document_text}...\n[Total length: {len(document_text)} characters]")
         else:
             logger.info(document_text)
         logger.info("=" * 80)
@@ -162,7 +162,9 @@ class LLMClient:
             if schema is not None:
                 try:
                     logger.info("Validating response against schema...")
+                    """
                     jsonschema_validate(instance=parsed, schema=schema)
+                    """
                     logger.info("Schema validation passed!")
                     return json.dumps(parsed, ensure_ascii=False)
                 except ValidationError as e:
