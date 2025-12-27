@@ -7,10 +7,9 @@ import subprocess
 from typing import Optional
 from pathlib import Path
 
-from extract_text import extract_text_structured
+from cv_text_extractor import extract_text_structured
 from llm_client import create_llm_client
 from converter import convert_input
-import time
 
 # Configure logging
 logging.basicConfig(

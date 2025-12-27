@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from jsonschema import validate as jsonschema_validate, ValidationError
 
-from extract_text import extract_readable_text
+from cv_text_extractor import extract_readable_text
 
 logger = logging.getLogger(__name__)
 

@@ -1,4 +1,4 @@
-from extract_text import extract_text_structured
+from cv_text_extractor import extract_text_structured
 
 
 def test_extract_realistic_docx_pages():

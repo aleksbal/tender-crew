@@ -33,32 +33,52 @@ SECTIONY_RE = re.compile(
     r"""
     ^
     \s*
-    (?:                                   # any heading containing…
-        .*?\b(
-            profil|
-            zusammenfassung|
-            kurzprofil|
-            beruf|
-            werdegang|
-            erfahrung|
-            projekt|
-            tätigkeit|
-            skills?|
-            kenntnisse|
-            technologien?|
-            stack|
-            education|
-            ausbildung|
-            certificates?|
-            zertifikate|
-            languages?|
-            sprachen
-        )\b.*?
+    (?:
+        # German
+        profil |
+        zusammenfassung |
+        kurzprofil |
+        beruflicher\s+werdegang |
+        berufserfahrung |
+        projekte |
+        projekt(e)? |
+        tätigkeiten |
+        fähigkeiten |
+        skills |
+        kenntnisse |
+        technologien |
+        technik(en)? |
+        tech\s*stack |
+        ausbildung |
+        studium |
+        zertifikate |
+        qualifikationen |
+        sprachen |
+
+        # English
+        profile |
+        summary |
+        professional\s+summary |
+        work\s+experience |
+        professional\s+experience |
+        experience |
+        employment |
+        projects |
+        skills |
+        expertise |
+        technologies |
+        tech\s*stack |
+        education |
+        certifications |
+        qualifications |
+        languages
     )
+    \s*:?        # optional trailing colon
     \s*$
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
 
 FOOTER_RE = re.compile(r"^\s*Lebenslauf\b.*\bSeite\s+\d+\s*$", re.IGNORECASE)
 
@@ -66,24 +86,6 @@ FOOTER_RE = re.compile(r"^\s*Lebenslauf\b.*\bSeite\s+\d+\s*$", re.IGNORECASE)
 # =============================================================================
 # Public API
 # =============================================================================
-
-def extract_text(path: str) -> Tuple[str, ExtractDiagnostics]:
-    """
-    Simple API: return readable text + diagnostics.
-    - DOCX: paragraphs + tables
-    - PDF: WORDS -> lines -> per-page text (robust for CV layouts)
-    """
-    ext = os.path.splitext(path.lower())[1]
-    if ext == ".docx":
-        text = _docx_to_text(path)
-        return text, ExtractDiagnostics(file_type="docx", pages=1)
-
-    if ext == ".pdf":
-        text, diag = _pdf_to_text_words(path)
-        return text, diag
-
-    raise ValueError(f"Unsupported file type: {ext}")
-
 
 def extract_text_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
     """
@@ -144,24 +146,6 @@ def extract_readable_text(structured: Dict) -> str:
 # =============================================================================
 # DOCX
 # =============================================================================
-
-def _docx_to_text(path: str) -> str:
-    doc = Document(path)
-    lines: List[str] = []
-
-    for p in doc.paragraphs:
-        t = (p.text or "").strip()
-        if t:
-            lines.append(t)
-
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
-            if cells:
-                lines.append(" | ".join(cells))
-
-    return "\n".join(lines).strip() + "\n"
-
 
 def _docx_to_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
     doc = Document(path)
@@ -236,40 +220,6 @@ def _normalize_block(block: str) -> List[str]:
 # PDF (FIXED): WORDS -> LINES (for both readable and structured)
 # =============================================================================
 
-def _pdf_to_text_words(path: str) -> Tuple[str, ExtractDiagnostics]:
-    """
-    Robust PDF -> text:
-    - Extract WORDS (not blocks)
-    - Reconstruct LINES by y clustering
-    - Sort words left->right within each line
-    - Keep EVERYTHING (don’t drop header/right here)
-    """
-    doc = fitz.open(path)
-    diag = ExtractDiagnostics(file_type="pdf", pages=doc.page_count)
-    out_lines: List[str] = []
-
-    for pno in range(doc.page_count):
-        page = doc.load_page(pno)
-        words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,wordno)
-
-        if not words:
-            diag.rejected_scanned_pdf = True
-            diag.empty_text_pages += 1
-            raise ValueError(
-                f"PDF page {pno+1} has no extractable text (scanned/bitmap?). Rejecting by policy."
-            )
-
-        lines = _words_to_lines(words)
-
-        out_lines.append(f"--- Page {pno+1} ---")
-        out_lines.append("")
-        out_lines.extend(lines)
-        out_lines.append("")
-        out_lines.append("")  # spacer
-
-    return "\n".join(out_lines).strip() + "\n", diag
-
-
 def _pdf_to_structured_words(path: str) -> Tuple[Dict, ExtractDiagnostics]:
     """
     Structured PDF extraction (WORDS->LINES):
@@ -333,63 +283,6 @@ def _pdf_to_structured_words(path: str) -> Tuple[Dict, ExtractDiagnostics]:
         })
 
     return {"file_type": "pdf", "pages": pages_out}, diag
-
-
-def _words_to_lines(words) -> List[str]:
-    """
-    Convert PyMuPDF words list into human-readable text lines.
-    - sort by y0 then x0
-    - cluster words into same line if y0 within tolerance
-    - within a line, sort by x0 and join (gap-based)
-    """
-    words_sorted = sorted(words, key=lambda w: (w[1], w[0]))
-    Y_TOL = 2.5
-
-    lines_out: List[str] = []
-    cur_line: List[tuple] = []
-    cur_y: Optional[float] = None
-
-    def flush_line():
-        nonlocal cur_line
-        if not cur_line:
-            return
-        cur_line.sort(key=lambda w: w[0])  # x0
-
-        parts: List[str] = []
-        prev_x1 = None
-        for (x0, y0, x1, y1, text, *_rest) in cur_line:
-            t = re.sub(r"\s+", " ", (text or "").strip())
-            if not t:
-                continue
-            if prev_x1 is None:
-                parts.append(t)
-            else:
-                gap = x0 - prev_x1
-                parts.append((" " if gap > 1.5 else "") + t)
-            prev_x1 = x1
-
-        line_text = "".join(parts).strip()
-        if line_text:
-            lines_out.append(line_text)
-
-        cur_line = []
-
-    for w in words_sorted:
-        x0, y0, x1, y1, text, *_ = w
-        if cur_y is None:
-            cur_y = y0
-            cur_line.append(w)
-            continue
-        if abs(y0 - cur_y) <= Y_TOL:
-            cur_line.append(w)
-        else:
-            flush_line()
-            cur_y = y0
-            cur_line.append(w)
-
-    flush_line()
-    return lines_out
-
 
 def _words_to_line_objects(words) -> List[Dict]:
     """
