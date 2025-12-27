@@ -3,15 +3,13 @@ cv_timeline_chunker.py
 
 Timeline chunker + tech list extractor for flattened CV text.
 
-Modifications applied (requested):
-1) Drop garbage lines from body:
-   - remove lines exactly "-", "•", bullet-only, empty.
-2) Fix tech pollution:
-   - stopwords + reject tokens containing "Werdegang", "Bildung" etc (EN+DE, generic).
-   - strip section headings BEFORE tech tokenization.
-3) Stop timeline chunking once you hit education/skills/etc (expanded section break regex).
-4) Add canonical text per chunk: `canonical_text`.
-5) Location parsing is NOT attempted (if you use it elsewhere, set null there).
+Fixes included (per your complaints + current output):
+- Drop garbage lines from body: remove lines that are exactly "-" or "•" or bullet-only.
+- Fix tech pollution: stopwords + strip headings before tech tokenization; reject tokens containing “Werdegang”, “Bildung”, etc.
+- Stop timeline chunking once you hit education/skills/etc (expanded section break regex).
+- Do NOT try to parse location: we DROP location-like single-city lines from header/body/canonical_text.
+- Add canonical text per chunk: `canonical_text`.
+- Improve header/body split: header becomes (company + optional role/title); descriptive sentences go to body.
 """
 
 from __future__ import annotations
@@ -92,14 +90,13 @@ def _is_garbage_line(s: str) -> bool:
         return True
     if _GARBAGE_ONLY_RE.match(t):
         return True
-    # common weird leftovers: "- -" or " -"
-    if re.fullmatch(r"[-•·▪–—−\s]{1,6}", t):
+    if re.fullmatch(r"[-•·▪–—−\s]{1,10}", t):
         return True
     return False
 
 
 # ----------------------------
-# Date parsing (numeric + month names)
+# Date parsing
 # ----------------------------
 
 MONTHS: Dict[str, int] = {
@@ -129,9 +126,9 @@ MONTHS: Dict[str, int] = {
     "december": 12,
 }
 
-NUM_MMYYYY_RE = re.compile(r"^(0?[1-9]|1[0-2])[./](19\d{2}|20\d{2})$")  # 04/2019 or 04.2019
-NUM_YYYYMM_RE = re.compile(r"^(19\d{2}|20\d{2})-(0?[1-9]|1[0-2])$")    # 2019-04
-YEAR_ONLY_RE = re.compile(r"^(19\d{2}|20\d{2})$")                      # 2019
+NUM_MMYYYY_RE = re.compile(r"^(0?[1-9]|1[0-2])[./](19\d{2}|20\d{2})$")
+NUM_YYYYMM_RE = re.compile(r"^(19\d{2}|20\d{2})-(0?[1-9]|1[0-2])$")
+YEAR_ONLY_RE = re.compile(r"^(19\d{2}|20\d{2})$")
 MONTHNAME_RE = re.compile(r"^(?P<m>[A-Za-zÄÖÜäöüß]+)\s+(?P<y>19\d{2}|20\d{2})$")
 
 RANGE_GLUE_RE = re.compile(r"\s*(?:–|—|-|to|bis|until)\s*", re.IGNORECASE)
@@ -195,14 +192,12 @@ def parse_date_range(text: str, *, asof: Optional[str] = None) -> Optional[Tuple
     if not s:
         return None
 
-    # since/seit/ab -> open-ended
     if SINCE_RE.match(s):
         s2 = SINCE_RE.sub("", s).strip()
         start = parse_date_token(s2)
         if start:
             return start, (asof or start)
 
-    # "X ... bis heute/present"
     if PRESENT_RE.search(s):
         parts = RANGE_GLUE_RE.split(s, maxsplit=1)
         start = parse_date_token(parts[0].strip()) if parts else None
@@ -282,36 +277,20 @@ def default_asof() -> str:
 
 
 # ----------------------------
-# Tech extraction + normalization
+# Tech extraction
 # ----------------------------
 
 TECH_PREFIX_RE = re.compile(
-    r"""
-    ^
-    (?:
-      eingesetzte\s+technologien|technologien|tech(?:nologies)?\s+stack|tech\s*stack|stack|tools
-    )
-    \s*:\s*
-    """,
-    re.IGNORECASE | re.VERBOSE,
+    r"^(?:eingesetzte\s+technologien|technologien|tech(?:nologies)?\s+stack|tech\s*stack|stack|tools)\s*:\s*",
+    re.IGNORECASE,
 )
-
 TECH_BLOCK_START_RE = re.compile(
     r"^(eingesetzte\s+technologien|technologien|tech(?:nologies)?\s+stack|tech\s*stack|stack|tools)\s*:?\s*$",
     re.IGNORECASE,
 )
-
 TECH_BLOCK_STOP_RE = re.compile(
-    r"""
-    ^
-    (?:
-      -\s+|                    # bullet starts -> likely description resumes
-      aufgabe|verantwort|tätig|entwicklung|implement|migration|
-      role|responsibil|project|kunde|customer|
-      \[left_column\]|\[right_column\]|\[header_area\]|---\s*page
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
+    r"^(?:-\s+|aufgabe|verantwort|tätig|entwicklung|implement|migration|role|responsibil|project|kunde|customer|\[left_column\]|\[right_column\]|\[header_area\]|---\s*page)",
+    re.IGNORECASE,
 )
 
 TECH_SPLIT_RE = re.compile(r"\s*(?:,|;|\||/)\s*")
@@ -342,17 +321,14 @@ INLINE_TECH_PATTERNS = [
     r"\bazure\b",
     r"\bterraform\b",
     r"\bpostgres(?:ql)?\b",
-    r"\bmysql\b",
-    r"\bredis\b",
+    r"\bsql\b",
     r"\bkafka\b",
     r"\brabbitmq\b",
 ]
 INLINE_TECH_RE = re.compile("|".join(f"(?:{p})" for p in INLINE_TECH_PATTERNS), re.IGNORECASE)
 
-LOCATION_LINE_RE = re.compile(r"^[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]{2,40}$")
-
 TECHY_KEYWORDS_RE = re.compile(
-    r"\b(java|spring|aws|azure|kubernetes|k8s|docker|terraform|python|typescript|javascript|postgres|sql|kafka|grafana|prometheus|keycloak|junit|maven|gradle|git|helm|argocd|wiremock|testcontainers|liquibase|flyway|datadog|splunk|vault|nginx|react|angular|node)\b",
+    r"\b(java|spring|aws|azure|kubernetes|k8s|docker|terraform|python|typescript|javascript|postgres|sql|kafka|grafana|prometheus|keycloak|junit|maven|gradle|git|helm|wiremock|testcontainers|liquibase|flyway|datadog|splunk|vault|nginx|react|angular|node)\b",
     re.IGNORECASE,
 )
 
@@ -368,7 +344,8 @@ TECH_TOKEN_REJECT_SUBSTRINGS = {
 # headings that may appear inside/around tech lines; remove before splitting
 TECH_HEADING_STRIP_RE = re.compile(
     r"\b(beruflicher\s+werdegang|bildung|ausbildung|studium|kenntnisse|fähigkeiten|"
-    r"education|skills|languages|certifications|profile|summary)\b",
+    r"education|skills|languages|certifications|profile|summary|zusammenfassung|"
+    r"weitere\s+kenntnisse\s+und\s+fähigkeiten)\b",
     re.IGNORECASE,
 )
 
@@ -437,21 +414,20 @@ def extract_inline_tech_mentions(lines: List[str]) -> List[str]:
     for m in INLINE_TECH_RE.finditer(text):
         found.append(normalize_tech_token(m.group(0)))
     found = [_clean_tech_token(x) for x in found if x]
-    # NEW: apply same pollution filter
-    out = []
+
+    out: List[str] = []
     for x in found:
         low = x.lower()
         if any(bad in low for bad in TECH_TOKEN_REJECT_SUBSTRINGS):
             continue
         out.append(x)
+
     return _dedupe_preserve_order([x for x in out if x])
 
 
 def _looks_like_comma_heavy_stack(line: str) -> bool:
     s = line.strip()
     if not s or s.startswith("-"):
-        return False
-    if LOCATION_LINE_RE.match(s):
         return False
     comma_count = s.count(",")
     if comma_count < 3:
@@ -485,8 +461,6 @@ def extract_technologies_from_lines(lines: List[str]) -> List[str]:
                     break
                 if looks_like_range_start_payload(nxt):
                     break
-                if LOCATION_LINE_RE.match(nxt):
-                    break
                 block_parts.append(nxt)
                 j += 1
             collected.extend(_parse_tech_block(" ".join(block_parts)))
@@ -505,8 +479,6 @@ def extract_technologies_from_lines(lines: List[str]) -> List[str]:
                     break
                 if looks_like_range_start_payload(nxt):
                     break
-                if LOCATION_LINE_RE.match(nxt):
-                    break
                 block_parts.append(nxt)
                 j += 1
             collected.extend(_parse_tech_block(" ".join(block_parts)))
@@ -524,8 +496,6 @@ def extract_technologies_from_lines(lines: List[str]) -> List[str]:
                 if TECH_BLOCK_STOP_RE.match(nxt):
                     break
                 if looks_like_range_start_payload(nxt):
-                    break
-                if LOCATION_LINE_RE.match(nxt):
                     break
                 if _looks_like_comma_heavy_stack(nxt) or TECHY_KEYWORDS_RE.search(nxt):
                     block_parts.append(nxt)
@@ -583,11 +553,56 @@ SECTION_BREAK_RE = re.compile(
         profile|profil|summary|zusammenfassung|
         publications?|publikationen|
         interests?|interessen|
-        awards?|auszeichnungen
+        awards?|auszeichnungen|
+        weitere\s+kenntnisse
     )\b
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+# DROP location-like single-line city tokens entirely (you said: don't care)
+# Keep it conservative: "Hamburg", "Berlin", "Wien", "München" etc.
+LOCATION_LIKE_RE = re.compile(r"^[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]{2,40}$")
+
+# Heuristic: descriptive lines should be body, not header
+DESC_HINT_RE = re.compile(
+    r"\b(beratung|entwicklung|implement|migration|aufbau|konzeption|analyse|"
+    r"development|implementation|migration|design|architecture|monitoring|testing|"
+    r"automatisierung|einführung|weiterentwicklung|optimierung)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_description(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    # long sentences -> likely body
+    if len(s) >= 60:
+        return True
+    if s.count(" ") >= 7:
+        return True
+    if DESC_HINT_RE.search(s):
+        return True
+    # starts with verb-ish bullet missing dash
+    if re.match(r"^(Integration|Entwicklung|Implementierung|Migration|Aufbau|Konzeption|Optimierung|Einführung|Weiterentwicklung)\b", s):
+        return True
+    return False
+
+
+def _looks_like_company(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if LOCATION_LIKE_RE.match(s):
+        return False
+    # company-ish suffixes
+    if re.search(r"\b(GmbH|AG|SE|KG|UG|Inc\.?|Ltd\.?|LLC|S\.?A\.?|S\.?r\.?l\.?)\b", s):
+        return True
+    # very short, title-case-ish and not a sentence
+    if len(s) <= 50 and s.count(" ") <= 6 and not _looks_like_description(s):
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -598,7 +613,7 @@ class TimelineChunk:
     header_lines: List[str]
     body_lines: List[str]
     technologies: List[str]
-    canonical_text: str   # NEW: canonical text per chunk
+    canonical_text: str
     source_pages: List[int]
 
 
@@ -674,7 +689,7 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 
         start_ym, end_ym, open_ended = anchor
 
-        # If this was "07/2024 bis" (no inline end), try to pick up end date in the next date-ish line
+        # If this was "07/2024 bis" (no inline end), read end date from following date-ish line
         j = i + 1
         if not open_ended and parse_date_range(candidate, asof=asof) is None:
             while j < len(lines):
@@ -733,45 +748,63 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
             # NEW: stop collecting / stop chunking when section breaks
             if SECTION_BREAK_RE.match(cand_k):
                 break
-
             if parse_anchor(cand_k):
                 break
-
             if is_right_column_line(raw_k):
                 k += 1
                 continue
 
-            if cand_k and not _is_garbage_line(cand_k):  # NEW: drop garbage lines here
-                collected_lines.append(cand_k)
+            if not cand_k or _is_garbage_line(cand_k):
+                k += 1
+                continue
 
+            # DROP location-ish lines entirely
+            if LOCATION_LIKE_RE.match(cand_k):
+                k += 1
+                continue
+
+            collected_lines.append(cand_k)
             k += 1
 
-        # Split header/body (same heuristic, but body won't contain garbage)
+        # Header/body: company + optional role/title; everything descriptive goes body
         header_lines: List[str] = []
         body_lines: List[str] = []
 
         for ln in collected_lines:
             if not ln or _is_garbage_line(ln):
                 continue
+            if LOCATION_LIKE_RE.match(ln):
+                continue
 
+            # normalize bullets to "- ..." and drop bullet-only
             if ln.startswith("-") or ln.startswith("•"):
                 # normalize bullet to "- ..." and drop bullet-only lines
                 cleaned = ln.lstrip("•").strip()
                 if _is_garbage_line(cleaned):
                     continue
-                body_lines.append("- " + cleaned if not cleaned.startswith("-") else cleaned)
+                body_lines.append(cleaned if cleaned.startswith("-") else "- " + cleaned)
                 continue
 
+            # tech header line belongs to body
             if TECH_HEADER_STOP_RE.match(ln):
                 body_lines.append(ln)
                 continue
 
-            if not body_lines and len(header_lines) < 4:
+            # prefer company as first header line if it looks like company
+            if not header_lines and _looks_like_company(ln) and not _looks_like_description(ln):
                 header_lines.append(ln)
-            else:
-                body_lines.append(ln)
+                continue
 
-        # NEW: canonical text (stable, cleaned, no bullet-only garbage)
+            # optional role/title line (short, not a sentence)
+            if len(header_lines) == 1 and not body_lines:
+                if not _looks_like_description(ln) and len(ln) <= 60 and ln.count(" ") <= 8:
+                    header_lines.append(ln)
+                    continue
+
+            # otherwise: body
+            body_lines.append(ln)
+
+        # canonical text
         canonical_parts = []
         canonical_parts.extend([x for x in header_lines if x and not _is_garbage_line(x)])
         canonical_parts.extend([x for x in body_lines if x and not _is_garbage_line(x)])
@@ -807,7 +840,7 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 
 
 # ----------------------------
-# Aggregation: tech -> total months
+# Aggregation
 # ----------------------------
 
 def aggregate_tech_months(chunks: List[TimelineChunk]) -> Dict[str, int]:
@@ -855,6 +888,7 @@ if __name__ == "__main__":
 [LEFT_COLUMN] 07/2024 bis
 [LEFT_COLUMN] 02/2025
 50Hertz Transmission GmbH
+Beratung und Entwicklung in der agilen Produktentwicklung über alle Phasen
 Hamburg
 •
 Integration von Microservices auf Basis von Java
@@ -866,6 +900,8 @@ Eingesetzte Technologien: Java 21, Python 3.10, Kubernetes
 [LEFT_COLUMN] 04/2024 bis
 [LEFT_COLUMN] 06/2024
 Adobe Systems Engineering GmbH
+Hamburg
+Implementierung von Cloud-Infrastruktur mit Amazon Web Services (AWS)
 Eingesetzte Technologien:
 AWS, Terraform, OpenStack Beruflicher Werdegang
 
