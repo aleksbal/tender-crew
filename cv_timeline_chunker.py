@@ -1,36 +1,17 @@
 """
 cv_timeline_chunker.py
 
-Single-file, production-oriented timeline chunker + tech list extractor for “flattened table” CV text like:
+Timeline chunker + tech list extractor for flattened CV text.
 
-[LEFT_COLUMN] 07/2024 bis
-...
-[LEFT_COLUMN] 02/2025
-...
-Eingesetzte Technologien: Java 21, Python 3.10, ...
-
-Includes:
-- Robust date parsing:
-  - 04/2019, 04.2019, 2019-04
-  - April 2019, Apr 2019, März 2020 (DE+EN month names)
-  - ranges like "April 2019 - Juni 2022"
-  - open-ended like "seit April 2019", "bis heute/present"
-- Timeline chunking for flattened multi-column dumps:
-  - Works with tagged lines ([LEFT_COLUMN], [HEADER_AREA], [RIGHT_COLUMN])
-  - Also works with tagless lines (plain text)
-  - End date often appears in the next date-ish line
-  - Keeps [HEADER_AREA] payload as BODY content (important for spillover bullets/tech across pages)
-  - Ignores [RIGHT_COLUMN] entirely (sidebars/footers)
-- Tech extraction:
-  - Explicit blocks: "Eingesetzte Technologien: ..."
-  - Wrapped blocks (prefix alone + following lines)
-  - Prefix-less comma-heavy stacks
-  - Inline fallback from free text
-- Output:
-  - Each chunk includes `months` duration
-  - Aggregated "tech -> total months"
-
-No external dependencies (stdlib only).
+Modifications applied (requested):
+1) Drop garbage lines from body:
+   - remove lines exactly "-", "•", bullet-only, empty.
+2) Fix tech pollution:
+   - stopwords + reject tokens containing "Werdegang", "Bildung" etc (EN+DE, generic).
+   - strip section headings BEFORE tech tokenization.
+3) Stop timeline chunking once you hit education/skills/etc (expanded section break regex).
+4) Add canonical text per chunk: `canonical_text`.
+5) Location parsing is NOT attempted (if you use it elsewhere, set null there).
 """
 
 from __future__ import annotations
@@ -45,7 +26,14 @@ from typing import Dict, Iterable, List, Optional, Tuple
 # Text normalization
 # ----------------------------
 
-_BULLETS = {"•", "‣", "∙", "◦", "·", "●", "▪", "–", "—", "−", "•"}
+_BULLETS = {"•", "‣", "∙", "◦", "·", "●", "▪", "–", "—", "−"}
+
+# Garbage lines you explicitly want removed from body/chunk text
+_GARBAGE_EXACT = {
+    "", "-", "•", "·", "▪", "–", "—", "−",
+}
+# Also treat pure bullet markers / bullet-only lines as garbage
+_GARBAGE_ONLY_RE = re.compile(r"^\s*(?:[-•·▪–—−]+)\s*$")
 
 
 def normalize_text(text: str) -> str:
@@ -53,7 +41,7 @@ def normalize_text(text: str) -> str:
     Normalize extracted CV text (PDF/DOCX -> text):
     - normalize newlines
     - remove private use area glyphs (common for icon fonts)
-    - de-hyphenate line breaks: "micro-\\nservices" -> "microservices"
+    - de-hyphenate line breaks: "micro-\nservices" -> "microservices"
     - fix within-line broken hyphenations: "Com- pose" -> "Compose"
     - normalize bullets to "- "
     - collapse whitespace while preserving newlines
@@ -94,6 +82,20 @@ def _strip_noise(line: str) -> str:
     s = line.strip()
     s = re.sub(r"[\uf000-\uf8ff]", "", s)
     return s.strip()
+
+
+def _is_garbage_line(s: str) -> bool:
+    if s is None:
+        return True
+    t = s.strip()
+    if t in _GARBAGE_EXACT:
+        return True
+    if _GARBAGE_ONLY_RE.match(t):
+        return True
+    # common weird leftovers: "- -" or " -"
+    if re.fullmatch(r"[-•·▪–—−\s]{1,6}", t):
+        return True
+    return False
 
 
 # ----------------------------
@@ -267,10 +269,6 @@ def looks_like_range_start_payload(payload: str) -> bool:
 
 
 def month_diff_inclusive(start_ym: str, end_ym: str) -> int:
-    """
-    Inclusive month duration between YYYY-MM and YYYY-MM.
-    2024-07..2025-02 => 8 months.
-    """
     sy, sm = start_ym.split("-")
     ey, em = end_ym.split("-")
     s = int(sy) * 12 + int(sm)
@@ -279,9 +277,6 @@ def month_diff_inclusive(start_ym: str, end_ym: str) -> int:
 
 
 def default_asof() -> str:
-    """
-    Resolve 'bis heute/present' as current month at extraction time.
-    """
     today = date.today()
     return f"{today.year:04d}-{today.month:02d}"
 
@@ -347,7 +342,7 @@ INLINE_TECH_PATTERNS = [
     r"\bazure\b",
     r"\bterraform\b",
     r"\bpostgres(?:ql)?\b",
-    r"\bmysql\b",                 # add MySQL here (inline case)
+    r"\bmysql\b",
     r"\bredis\b",
     r"\bkafka\b",
     r"\brabbitmq\b",
@@ -358,6 +353,22 @@ LOCATION_LINE_RE = re.compile(r"^[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]{2,40}$")
 
 TECHY_KEYWORDS_RE = re.compile(
     r"\b(java|spring|aws|azure|kubernetes|k8s|docker|terraform|python|typescript|javascript|postgres|sql|kafka|grafana|prometheus|keycloak|junit|maven|gradle|git|helm|argocd|wiremock|testcontainers|liquibase|flyway|datadog|splunk|vault|nginx|react|angular|node)\b",
+    re.IGNORECASE,
+)
+
+# ---- NEW: generic EN+DE stopwords / pollution guards for tech tokens ----
+TECH_TOKEN_REJECT_SUBSTRINGS = {
+    # DE
+    "beruflicher", "werdegang", "bildung", "ausbildung", "studium",
+    "kenntnisse", "fähigkeiten", "sprachen", "zertifikate", "profil",
+    # EN
+    "experience", "education", "skills", "languages", "certifications", "profile", "summary",
+}
+
+# headings that may appear inside/around tech lines; remove before splitting
+TECH_HEADING_STRIP_RE = re.compile(
+    r"\b(beruflicher\s+werdegang|bildung|ausbildung|studium|kenntnisse|fähigkeiten|"
+    r"education|skills|languages|certifications|profile|summary)\b",
     re.IGNORECASE,
 )
 
@@ -394,12 +405,29 @@ def _parse_tech_block(block_text: str) -> List[str]:
     bt = block_text.strip()
     if not bt:
         return []
+
+    # NEW: strip headings that leak into the block before tokenizing
+    bt = TECH_HEADING_STRIP_RE.sub(" ", bt)
+    bt = re.sub(r"\s{2,}", " ", bt).strip()
+
     bt = re.sub(r"(\w)-\s+(\w)", r"\1\2", bt)
     bt = re.sub(r"\s{2,}", " ", bt)
     raw_tokens = TECH_SPLIT_RE.split(bt)
-    tokens = [_clean_tech_token(t) for t in raw_tokens]
-    tokens = [t for t in tokens if t]
-    tokens = [normalize_tech_token(t) for t in tokens if t]
+
+    tokens = []
+    for raw in raw_tokens:
+        ct = _clean_tech_token(raw)
+        if not ct:
+            continue
+        ct = normalize_tech_token(ct)
+        if not ct:
+            continue
+        low = ct.lower()
+        # NEW: reject polluted tokens by substring
+        if any(bad in low for bad in TECH_TOKEN_REJECT_SUBSTRINGS):
+            continue
+        tokens.append(ct)
+
     return tokens
 
 
@@ -409,7 +437,14 @@ def extract_inline_tech_mentions(lines: List[str]) -> List[str]:
     for m in INLINE_TECH_RE.finditer(text):
         found.append(normalize_tech_token(m.group(0)))
     found = [_clean_tech_token(x) for x in found if x]
-    return _dedupe_preserve_order([x for x in found if x])
+    # NEW: apply same pollution filter
+    out = []
+    for x in found:
+        low = x.lower()
+        if any(bad in low for bad in TECH_TOKEN_REJECT_SUBSTRINGS):
+            continue
+        out.append(x)
+    return _dedupe_preserve_order([x for x in out if x])
 
 
 def _looks_like_comma_heavy_stack(line: str) -> bool:
@@ -510,7 +545,11 @@ def extract_technologies_from_lines(lines: List[str]) -> List[str]:
             continue
         if not TECH_TOKEN_OK_RE.match(ct):
             continue
+        low = ct.lower()
         if ct.lower() in {"technologien", "eingesetzte technologien", "tools", "stack"}:
+            continue
+        # NEW: reject polluted tokens
+        if any(bad in low for bad in TECH_TOKEN_REJECT_SUBSTRINGS):
             continue
         cleaned.append(ct)
 
@@ -531,9 +570,23 @@ RIGHT_COL_RE = re.compile(r"^\[RIGHT_COLUMN\]\s*(.*)$")
 HEADER_RE = re.compile(r"^\[HEADER_AREA\]\s*(.*)$")
 PAGE_RE = re.compile(r"^---\s*Page\s+\d+\s*---\s*$", re.IGNORECASE)
 
+# NEW: expanded and stronger section break list (stop chunking entirely)
 SECTION_BREAK_RE = re.compile(
-    r"^(skills|kenntnisse|education|ausbildung|certifications|zertifikate|languages|sprachen)\b",
-    re.IGNORECASE,
+    r"""
+    ^
+    (?:
+        beruflicher\s+werdegang|
+        bildung|ausbildung|studium|
+        kenntnisse|fähigkeiten|skills?|
+        zertifikate|certifications?|
+        sprachen|languages?|
+        profile|profil|summary|zusammenfassung|
+        publications?|publikationen|
+        interests?|interessen|
+        awards?|auszeichnungen
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
@@ -545,6 +598,7 @@ class TimelineChunk:
     header_lines: List[str]
     body_lines: List[str]
     technologies: List[str]
+    canonical_text: str   # NEW: canonical text per chunk
     source_pages: List[int]
 
 
@@ -556,6 +610,8 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
     Also:
       - keeps [HEADER_AREA] payload as body (NOT skipped)
       - ignores RIGHT_COLUMN entirely
+      - NEW: stops chunking when SECTION_BREAK_RE hits
+      - NEW: removes garbage bullet-only lines from body and canonical_text
     """
     norm = normalize_text(text)
     lines = [ln.rstrip("\n") for ln in norm.splitlines()]
@@ -607,6 +663,10 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 
         candidate = strip_any_tag(raw)
 
+        # NEW: global stop once we hit non-experience sections
+        if SECTION_BREAK_RE.match(candidate):
+            break
+
         anchor = parse_anchor(candidate)
         if not anchor:
             i += 1
@@ -629,13 +689,16 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 
                 cand_j = strip_any_tag(raw_j)
 
+                # NEW: stop if section break starts
+                if SECTION_BREAK_RE.match(cand_j):
+                    break
+
                 # stop if next anchor starts
                 if parse_start_from_payload(cand_j):
                     break
 
                 end_tok = parse_date_token(cand_j)
                 if not end_tok:
-                    # try compacting spaces (e.g., "Jun 2022")
                     end_tok = parse_date_token(re.sub(r"\s{2,}", " ", cand_j))
 
                 if end_tok:
@@ -665,10 +728,12 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
                 k += 1
                 continue
 
-            if SECTION_BREAK_RE.match(raw_k):
+            cand_k = strip_any_tag(raw_k)
+
+            # NEW: stop collecting / stop chunking when section breaks
+            if SECTION_BREAK_RE.match(cand_k):
                 break
 
-            cand_k = strip_any_tag(raw_k)
             if parse_anchor(cand_k):
                 break
 
@@ -676,32 +741,45 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
                 k += 1
                 continue
 
-            if cand_k:
+            if cand_k and not _is_garbage_line(cand_k):  # NEW: drop garbage lines here
                 collected_lines.append(cand_k)
 
             k += 1
 
-        # Split header/body
+        # Split header/body (same heuristic, but body won't contain garbage)
         header_lines: List[str] = []
         body_lines: List[str] = []
 
         for ln in collected_lines:
-            if not ln:
+            if not ln or _is_garbage_line(ln):
                 continue
+
             if ln.startswith("-") or ln.startswith("•"):
-                body_lines.append("- " + ln.lstrip("•").strip() if ln.startswith("•") else ln)
+                # normalize bullet to "- ..." and drop bullet-only lines
+                cleaned = ln.lstrip("•").strip()
+                if _is_garbage_line(cleaned):
+                    continue
+                body_lines.append("- " + cleaned if not cleaned.startswith("-") else cleaned)
                 continue
+
             if TECH_HEADER_STOP_RE.match(ln):
                 body_lines.append(ln)
                 continue
+
             if not body_lines and len(header_lines) < 4:
                 header_lines.append(ln)
             else:
                 body_lines.append(ln)
 
+        # NEW: canonical text (stable, cleaned, no bullet-only garbage)
+        canonical_parts = []
+        canonical_parts.extend([x for x in header_lines if x and not _is_garbage_line(x)])
+        canonical_parts.extend([x for x in body_lines if x and not _is_garbage_line(x)])
+        canonical_text = "\n".join(canonical_parts).strip()
+
         techs = extract_technologies_from_lines(header_lines + body_lines)
 
-        content_len = sum(len(x) for x in header_lines) + sum(len(x) for x in body_lines)
+        content_len = sum(len(x) for x in canonical_parts)
         if content_len >= 20:
             months = month_diff_inclusive(start_ym, end_ym)
             chunks.append(
@@ -712,11 +790,18 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
                     header_lines=header_lines,
                     body_lines=body_lines,
                     technologies=techs,
+                    canonical_text=canonical_text,
                     source_pages=pages,
                 )
             )
 
         i = k
+
+        # NEW: if we stopped because section break, stop timeline chunking completely
+        if i < len(lines):
+            nxt = strip_any_tag(lines[i].strip())
+            if SECTION_BREAK_RE.match(nxt):
+                break
 
     return chunks
 
@@ -727,7 +812,7 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 
 def aggregate_tech_months(chunks: List[TimelineChunk]) -> Dict[str, int]:
     """
-    Simple, pragmatic rule:
+    Pragmatic rule:
     If a technology appears in a chunk, count the full chunk duration for that technology.
     """
     totals: Dict[str, int] = {}
@@ -743,8 +828,8 @@ def aggregate_tech_months(chunks: List[TimelineChunk]) -> Dict[str, int]:
 
 def extract_timeline_tech_and_totals(text: str, *, asof: Optional[str] = None) -> Dict[str, object]:
     """
-    Final, pragmatic output:
-      - chunks[] each includes months + extracted tech list
+    Final output:
+      - chunks[] each includes months + extracted tech list + canonical_text
       - tech_months: aggregated totals across chunks
       - asof_used: actual YYYY-MM used for open-ended ranges
     """
@@ -767,44 +852,36 @@ if __name__ == "__main__":
     SAMPLE = r"""
 --- Page 1 ---
 
-[HEADER_AREA] [LEFT_COLUMN] 
-1986 (39) · Mainz
-
 [LEFT_COLUMN] 07/2024 bis
-
-Senior Fullstack Software Developer
-
 [LEFT_COLUMN] 02/2025
-
 50Hertz Transmission GmbH
-
-[LEFT_COLUMN] Hamburg
-
+Hamburg
 •
 Integration von Microservices auf Basis von Java
-
-Eingesetzte Technologien: Java 21, Python 3.10, TypeScript, JavaScript, Spring Boot 3.4, Kubernetes, Docker
+-
+Eingesetzte Technologien: Java 21, Python 3.10, Kubernetes
 
 --- Page 2 ---
 
 [LEFT_COLUMN] 04/2024 bis
-Site Reliability Engineer
 [LEFT_COLUMN] 06/2024
 Adobe Systems Engineering GmbH
-[HEADER_AREA] • Implementierung von Cloud-Infrastruktur mit Amazon Web Services (AWS)
-[HEADER_AREA] • Realisierung von Infrastructure-as-Code (IaC) mit Terraform
-Eingesetzte Technologien: AWS, Terraform, Prometheus, Grafana
+Eingesetzte Technologien:
+AWS, Terraform, OpenStack Beruflicher Werdegang
+
+Bildung
+Master of Science ...
 """
 
     result = extract_timeline_tech_and_totals(SAMPLE, asof="2025-12")
-
     for idx, ch in enumerate(result["chunks"], 1):
         print(f"\n== Chunk {idx} ==")
         print(ch["start_date"], "->", ch["end_date"], f"({ch['months']} months)")
         print("HEADER:", ch["header_lines"])
+        print("BODY:", ch["body_lines"])
+        print("CANONICAL:\n", ch["canonical_text"])
         print("TECH:", ch["technologies"])
-        print("BODY (first lines):", ch["body_lines"][:8])
 
-    print("\n== Aggregated tech months (top 25) ==")
+    print("\n== Aggregated tech months ==")
     for tech, m in list(result["tech_months"].items())[:25]:
         print(f"{tech}: {m}")

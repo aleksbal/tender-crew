@@ -286,21 +286,32 @@ def _pdf_to_structured_words(path: str) -> Tuple[Dict, ExtractDiagnostics]:
 
 def _words_to_line_objects(words) -> List[Dict]:
     """
-    Like _words_to_lines but returns:
-      [{"bbox":[x0,y0,x1,y1], "text":"..."}]
+    Production-ish: build lines by (block_no, line_no) from PyMuPDF words.
+    words tuple: (x0, y0, x1, y1, "word", block_no, line_no, word_no)
+    This avoids y-tolerance heuristics entirely.
     """
-    words_sorted = sorted(words, key=lambda w: (w[1], w[0]))
-    Y_TOL = 2.5
+    # group words by (block_no, line_no)
+    groups: Dict[tuple, List[tuple]] = {}
+    for w in words:
+        if len(w) < 8:
+            # Defensive: unexpected format
+            continue
+        x0, y0, x1, y1, text, block_no, line_no, word_no = w[:8]
+        key = (int(block_no), int(line_no))
+        groups.setdefault(key, []).append(w)
+
+    # Sort lines top-to-bottom using min y0 of the group, then min x0
+    line_items = []
+    for key, ws in groups.items():
+        min_y0 = min(w[1] for w in ws)
+        min_x0 = min(w[0] for w in ws)
+        line_items.append((min_y0, min_x0, key, ws))
+    line_items.sort(key=lambda t: (t[0], t[1]))
 
     out: List[Dict] = []
-    cur: List[tuple] = []
-    cur_y: Optional[float] = None
-
-    def flush():
-        nonlocal cur
-        if not cur:
-            return
-        cur.sort(key=lambda w: w[0])  # x0
+    for _min_y0, _min_x0, _key, ws in line_items:
+        # sort words left-to-right using word_no then x0 (word_no usually stable)
+        ws.sort(key=lambda w: (int(w[7]), w[0]))
 
         parts: List[str] = []
         prev_x1 = None
@@ -310,7 +321,7 @@ def _words_to_line_objects(words) -> List[Dict]:
         max_x1 = float("-inf")
         max_y1 = float("-inf")
 
-        for (x0, y0, x1, y1, text, *_rest) in cur:
+        for (x0, y0, x1, y1, text, *_rest) in ws:
             min_x0 = min(min_x0, x0)
             min_y0 = min(min_y0, y0)
             max_x1 = max(max_x1, x1)
@@ -319,6 +330,7 @@ def _words_to_line_objects(words) -> List[Dict]:
             t = re.sub(r"\s+", " ", (text or "").strip())
             if not t:
                 continue
+
             if prev_x1 is None:
                 parts.append(t)
             else:
@@ -330,21 +342,6 @@ def _words_to_line_objects(words) -> List[Dict]:
         if line_text:
             out.append({"bbox": [min_x0, min_y0, max_x1, max_y1], "text": line_text})
 
-        cur = []
-
-    for w in words_sorted:
-        x0, y0, x1, y1, text, *_ = w
-        if cur_y is None:
-            cur_y = y0
-            cur.append(w)
-            continue
-        if abs(y0 - cur_y) <= Y_TOL:
-            cur.append(w)
-        else:
-            flush()
-            cur_y = y0
-            cur.append(w)
-
-    flush()
     return out
+
 

@@ -71,4 +71,4 @@ sample_out*.json
 *.temp
 *~
 sample_cv.docx
-realistic_cv.docx
+cv/realistic_cv.docx
