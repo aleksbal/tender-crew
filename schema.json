@@ -16,22 +16,23 @@
   "properties": {
     "personal_info": {
       "type": "object",
-      "description": "Basic contact details. Use realistic but safe values.",
+      "description": "Basic contact details. Do not invent values; use empty strings when absent or redacted.",
       "required": ["first_name", "last_name", "phone", "email"],
       "properties": {
-        "first_name": { "type": "string", "description": "Given name." },
-        "last_name":  { "type": "string", "description": "Family name." },
-        "address":    { "type": "string", "description": "Street, city, country if available." },
-        "phone":      { "type": "string", "description": "International format preferred." },
-        "email":      { "type": "string", "format": "email", "description": "Example: name@example.com" },
-        "linkedin":   { "type": "string", "format": "uri", "description": "Public LinkedIn profile URL if present." },
-        "website":    { "type": "string", "format": "uri", "description": "Personal site/portfolio URL if present." }
-      }
+        "first_name": { "type": "string", "description": "Given name or empty if missing/redacted." },
+        "last_name": { "type": "string", "description": "Family name or empty if missing/redacted." },
+        "address": { "type": "string", "description": "Street, city, country if available; otherwise empty." },
+        "phone": { "type": "string", "description": "International format preferred; otherwise empty." },
+        "email": { "type": "string", "format": "email", "description": "Email if present; otherwise empty string." },
+        "linkedin": { "type": "string", "format": "uri", "description": "Public LinkedIn profile URL if present; otherwise empty." },
+        "website": { "type": "string", "format": "uri", "description": "Personal site/portfolio URL if present; otherwise empty." }
+      },
+      "additionalProperties": false
     },
 
     "summary": {
       "type": "string",
-      "description": "Short professional summary tailored to the candidate’s field."
+      "description": "Short professional summary if explicitly present; otherwise empty."
     },
 
     "experience": {
@@ -39,22 +40,25 @@
       "description": "Employment history per company/role. Do NOT list project-level details here.",
       "items": {
         "type": "object",
-        "required": ["start_date", "end_date", "company", "role", "description"],
+        "required": ["start_date", "end_date", "company", "role", "description", "technologies", "evidence"],
         "properties": {
           "experience_id": {
             "type": "string",
             "description": "Optional stable identifier for cross-linking to projects (e.g., 'exp-1')."
           },
           "start_date": {
-            "type": "string",
-            "pattern": "^\\d{4}-\\d{2}$",
-            "description": "Employment start, format YYYY-MM (e.g., 2021-03)."
-          },
-          "end_date": {
-            "description": "Employment end. Use 'present' for current roles or a YYYY-MM date.",
+            "description": "Employment start, format YYYY-MM (e.g., 2021-03). Empty string if unknown.",
             "oneOf": [
               { "type": "string", "pattern": "^\\d{4}-\\d{2}$" },
-              { "type": "string", "const": "present" }
+              { "type": "string", "const": "" }
+            ]
+          },
+          "end_date": {
+            "description": "Employment end. Use 'present' for current roles, YYYY-MM, or empty string if unknown.",
+            "oneOf": [
+              { "type": "string", "pattern": "^\\d{4}-\\d{2}$" },
+              { "type": "string", "const": "present" },
+              { "type": "string", "const": "" }
             ]
           },
           "is_current": {
@@ -63,30 +67,35 @@
           },
           "company": {
             "type": "string",
-            "description": "Employer name only (no project name here)."
+            "description": "Employer name only (no project name here). Empty string if unknown."
           },
           "role": {
             "type": "string",
-            "description": "Job title (e.g., Senior Software Engineer)."
+            "description": "Job title (e.g., Senior Software Engineer). Empty string if unknown."
           },
           "location": {
             "type": "string",
-            "description": "City/Region/Country if available."
+            "description": "City/Region/Country if available; otherwise empty."
           },
           "employment_type": {
             "type": "string",
-            "description": "Full-time, Part-time, Contract, Freelance, Internship, etc."
+            "description": "Full-time, Part-time, Contract, Freelance, Internship, etc.; otherwise empty."
           },
           "description": {
             "type": "string",
-            "description": "Responsibilities, impact, achievements. Keep concise but informative."
+            "description": "Responsibilities, impact, achievements (entry-specific block). Empty string if missing."
           },
           "technologies": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "Programming languages, frameworks, tools, platforms (e.g., Spring Boot, Docker, AWS)."
+            "description": "Explicitly mentioned technologies only; empty array if none."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Short supporting excerpt/snippet from the source text; empty string if none."
           }
-        }
+        },
+        "additionalProperties": false
       }
     },
 
@@ -97,15 +106,25 @@
         "type": "object",
         "required": ["degree", "institution", "start_date", "end_date", "location"],
         "properties": {
-          "degree": {
-            "type": "string",
-            "description": "Degree name (e.g., M.Sc. Computer Science)."
+          "degree": { "type": "string", "description": "Degree name (e.g., M.Sc. Computer Science) or empty." },
+          "institution": { "type": "string", "description": "University or school or empty." },
+          "start_date": {
+            "description": "YYYY-MM or empty string if unknown.",
+            "oneOf": [
+              { "type": "string", "pattern": "^\\d{4}-\\d{2}$" },
+              { "type": "string", "const": "" }
+            ]
           },
-          "institution": { "type": "string", "description": "University or school." },
-          "start_date":  { "type": "string", "pattern": "^\\d{4}-\\d{2}$", "description": "YYYY-MM." },
-          "end_date":    { "type": "string", "pattern": "^\\d{4}-\\d{2}$", "description": "YYYY-MM." },
-          "location":    { "type": "string", "description": "City/Region/Country." }
-        }
+          "end_date": {
+            "description": "YYYY-MM or empty string if unknown.",
+            "oneOf": [
+              { "type": "string", "pattern": "^\\d{4}-\\d{2}$" },
+              { "type": "string", "const": "" }
+            ]
+          },
+          "location": { "type": "string", "description": "City/Region/Country or empty." }
+        },
+        "additionalProperties": false
       }
     },
 
@@ -122,14 +141,15 @@
         "technologies": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Frameworks, tools, platforms Programming languages, frameworks, tools, platforms (e.g., Java, Python, AWS, Spring Boot, NodeJS, JS, Docker etc.)."
+          "description": "Frameworks, cloud, platforms, tools explicitly listed (e.g., AWS, Spring Boot, Docker)."
         },
         "soft_skills": {
           "type": "array",
           "items": { "type": "string" },
           "description": "e.g., Communication, Leadership, Mentoring."
         }
-      }
+      },
+      "additionalProperties": false
     },
 
     "projects": {
@@ -145,44 +165,59 @@
           "industry",
           "role",
           "role_description",
-          "tools_and_frameworks"
+          "technologies",
+          "evidence"
         ],
         "properties": {
           "experience_id": {
             "type": "string",
-            "description": "Optional link to the related experience item."
+            "description": "Optional link to the related experience item (e.g., 'exp-1') or empty."
           },
-          "start_date": { "type": "string", "pattern": "^\\d{4}-\\d{2}$", "description": "YYYY-MM." },
-          "end_date":   { "type": "string", "pattern": "^\\d{4}-\\d{2}$", "description": "YYYY-MM." },
-          "project_name": { "type": "string", "description": "Project name. If original text is 'Company (Project)', keep only the project name here." },
-          "customer":   { "type": "string", "description": "End customer or internal client." },
-          "industry":   { "type": "string", "description": "e.g., Finance, Healthcare, Retail." },
-          "role":       { "type": "string", "description": "Short title for the project role (e.g., Lead Engineer)." },
-          "role_description": { "type": "string", "description": "What was done on this project, outcomes, scope." },
+          "start_date": {
+            "description": "YYYY-MM or empty string if unknown.",
+            "oneOf": [
+              { "type": "string", "pattern": "^\\d{4}-\\d{2}$" },
+              { "type": "string", "const": "" }
+            ]
+          },
+          "end_date": {
+            "description": "YYYY-MM or empty string if unknown. (Projects typically do not use 'present'.)",
+            "oneOf": [
+              { "type": "string", "pattern": "^\\d{4}-\\d{2}$" },
+              { "type": "string", "const": "" }
+            ]
+          },
+          "project_name": {
+            "type": "string",
+            "description": "Project name; empty string if unknown."
+          },
+          "customer": {
+            "type": "string",
+            "description": "End customer or internal client; empty if unknown."
+          },
+          "industry": {
+            "type": "string",
+            "description": "e.g., Finance, Healthcare, Retail; empty if unknown."
+          },
+          "role": {
+            "type": "string",
+            "description": "Short title for the project role (e.g., Lead Engineer); empty if unknown."
+          },
+          "role_description": {
+            "type": "string",
+            "description": "What was done on this project, outcomes, scope; empty if unknown."
+          },
           "technologies": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "Programming languages, frameworks, tools, platforms (e.g., Java, Python, AWS, Spring Boot, NodeJS, JS, Docker etc.)."
+            "description": "Explicitly mentioned tools/frameworks/tech only; empty array if none."
           },
-          "tools_and_frameworks": {
-            "type": "array",
-            "description": "Breakdown of effort per tool. Integers must sum to 100 across this array.",
-            "items": {
-              "type": "object",
-              "required": ["name", "project_effort_percentage"],
-              "properties": {
-                "name": { "type": "string", "description": "Tool/technology/process (e.g., React, Docker, Jira)." },
-                "project_effort_percentage": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 100,
-                  "description": "Whole number share of total effort for this project. All items together must equal 100."
-                }
-              }
-            },
-            "minItems": 1
+          "evidence": {
+            "type": "string",
+            "description": "Short supporting excerpt/snippet from the source text; empty string if none."
           }
-        }
+        },
+        "additionalProperties": false
       }
     },
 
@@ -191,12 +226,29 @@
       "description": "Professional certifications.",
       "items": {
         "type": "object",
-        "required": ["title", "issuer", "year"],
+        "required": ["title", "issuer", "year", "evidence"],
         "properties": {
-          "title":  { "type": "string", "description": "Certification title." },
-          "issuer": { "type": "string", "description": "Issuing organization." },
-          "year":   { "type": "integer", "description": "4-digit year." }
-        }
+          "title": { "type": "string", "description": "Certification title (exactly as stated) or empty if missing." },
+          "issuer": {
+            "description": "Issuing organization if explicitly stated; otherwise null or empty string.",
+            "oneOf": [
+              { "type": "string" },
+              { "type": "null" }
+            ]
+          },
+          "year": {
+            "description": "4-digit year if explicitly stated; otherwise null.",
+            "oneOf": [
+              { "type": "integer", "minimum": 1900, "maximum": 2100 },
+              { "type": "null" }
+            ]
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Short supporting excerpt/snippet from the source text; empty string if none."
+          }
+        },
+        "additionalProperties": false
       }
     },
 
@@ -207,9 +259,10 @@
         "type": "object",
         "required": ["language", "proficiency"],
         "properties": {
-          "language":    { "type": "string", "description": "e.g., German, English." },
+          "language": { "type": "string", "description": "e.g., German, English." },
           "proficiency": { "type": "string", "description": "e.g., Native, Fluent, Professional, Intermediate." }
-        }
+        },
+        "additionalProperties": false
       }
     },
 
@@ -218,6 +271,7 @@
       "description": "Optional list of interests or hobbies.",
       "items": { "type": "string" }
     }
-  }
+  },
+  "additionalProperties": false
 }
 

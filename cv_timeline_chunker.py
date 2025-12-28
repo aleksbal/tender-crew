@@ -3,13 +3,10 @@ cv_timeline_chunker.py
 
 Timeline chunker + tech list extractor for flattened CV text.
 
-Fixes included (per your complaints + current output):
-- Drop garbage lines from body: remove lines that are exactly "-" or "•" or bullet-only.
-- Fix tech pollution: stopwords + strip headings before tech tokenization; reject tokens containing “Werdegang”, “Bildung”, etc.
-- Stop timeline chunking once you hit education/skills/etc (expanded section break regex).
-- Do NOT try to parse location: we DROP location-like single-city lines from header/body/canonical_text.
-- Add canonical text per chunk: `canonical_text`.
-- Improve header/body split: header becomes (company + optional role/title); descriptive sentences go to body.
+Applied fixes (GENERAL, not CV-specific):
+✅ Anchor detection now works when dates/ranges appear *anywhere in a line* (e.g. "Project (2019 - 2024)")
+✅ Supports YEAR-only anchors like "(2025)" and year ranges "2019 - 2024"
+✅ Supports single-date anchors like "4/2006" by closing the chunk at (month before next anchor) instead of defaulting to asof
 """
 
 from __future__ import annotations
@@ -26,48 +23,26 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 _BULLETS = {"•", "‣", "∙", "◦", "·", "●", "▪", "–", "—", "−"}
 
-# Garbage lines you explicitly want removed from body/chunk text
-_GARBAGE_EXACT = {
-    "", "-", "•", "·", "▪", "–", "—", "−",
-}
-# Also treat pure bullet markers / bullet-only lines as garbage
+_GARBAGE_EXACT = {"", "-", "•", "·", "▪", "–", "—", "−"}
 _GARBAGE_ONLY_RE = re.compile(r"^\s*(?:[-•·▪–—−]+)\s*$")
 
 
 def normalize_text(text: str) -> str:
-    """
-    Normalize extracted CV text (PDF/DOCX -> text):
-    - normalize newlines
-    - remove private use area glyphs (common for icon fonts)
-    - de-hyphenate line breaks: "micro-\nservices" -> "microservices"
-    - fix within-line broken hyphenations: "Com- pose" -> "Compose"
-    - normalize bullets to "- "
-    - collapse whitespace while preserving newlines
-    - cap huge blank runs
-    """
     if not text:
         return ""
 
     t = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Remove private use area glyphs (icons)
     t = re.sub(r"[\uf000-\uf8ff]", "", t)
-
-    # De-hyphenate across line breaks: "micro-\nservices" -> "microservices"
     t = re.sub(r"(\w)-\n(\w)", r"\1\2", t)
-
-    # Fix within-line broken hyphenations: "Com- pose" -> "Compose"
     t = re.sub(r"(\w)-\s+(\w)", r"\1\2", t)
 
     lines: List[str] = []
     for line in t.split("\n"):
         s = line.strip()
 
-        # Normalize leading bullets
         if s and s[0] in _BULLETS:
             s = "- " + s[1:].lstrip()
 
-        # Collapse internal whitespace
         s = re.sub(r"[ \t]+", " ", s).strip()
         lines.append(s)
 
@@ -100,7 +75,6 @@ def _is_garbage_line(s: str) -> bool:
 # ----------------------------
 
 MONTHS: Dict[str, int] = {
-    # German
     "januar": 1, "jan": 1,
     "februar": 2, "feb": 2,
     "märz": 3, "maerz": 3, "mrz": 3, "mar": 3,
@@ -113,7 +87,6 @@ MONTHS: Dict[str, int] = {
     "oktober": 10, "okt": 10, "oct": 10,
     "november": 11, "nov": 11,
     "dezember": 12, "dez": 12, "dec": 12,
-    # English full names
     "january": 1,
     "february": 2,
     "march": 3,
@@ -137,14 +110,6 @@ PRESENT_RE = re.compile(r"\b(heute|aktuell|present|current|bis\s+heute)\b", re.I
 
 
 def parse_date_token(token: str) -> Optional[str]:
-    """
-    Convert a date token to YYYY-MM.
-    Supports:
-      - 04/2019, 04.2019
-      - 2019-04
-      - April 2019, Apr 2019, März 2020, Mrz 2020
-      - 2019 (falls back to 2019-01)
-    """
     t = token.strip().lower()
     t = t.replace(",", " ")
     t = re.sub(r"\s{2,}", " ", t).strip()
@@ -179,15 +144,6 @@ def parse_date_token(token: str) -> Optional[str]:
 
 
 def parse_date_range(text: str, *, asof: Optional[str] = None) -> Optional[Tuple[str, str]]:
-    """
-    Parse a date range from a string:
-      - "April 2019 - Juni 2022"
-      - "04/2019 bis 06/2022"
-      - "2019-04 – 2022-06"
-      - "seit April 2019"
-      - "... bis heute/present"
-    Returns (start_ym, end_ym) as YYYY-MM.
-    """
     s = text.strip()
     if not s:
         return None
@@ -277,7 +233,67 @@ def default_asof() -> str:
 
 
 # ----------------------------
-# Tech extraction
+# NEW: anchor detection anywhere in line (projects like "... (2019 - 2024)")
+# ----------------------------
+
+INLINE_YEAR_RANGE_RE = re.compile(
+    r"\b(19\d{2}|20\d{2})\s*(?:–|—|−|-|bis|to|until)\s*(19\d{2}|20\d{2})\b",
+    re.IGNORECASE,
+)
+INLINE_MMYYYY_RANGE_RE = re.compile(
+    r"\b(0?[1-9]|1[0-2])[./](19\d{2}|20\d{2})\s*(?:–|—|−|-|bis|to|until)\s*(0?[1-9]|1[0-2])[./](19\d{2}|20\d{2})\b",
+    re.IGNORECASE,
+)
+PAREN_SINGLE_YEAR_RE = re.compile(r"\((19\d{2}|20\d{2})\)")
+INLINE_SINGLE_MMYYYY_RE = re.compile(r"\b(0?[1-9]|1[0-2])[./](19\d{2}|20\d{2})\b")
+INLINE_SINGLE_YYYY_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+
+
+def find_date_anchor_anywhere(line: str, *, asof: Optional[str]) -> Optional[Tuple[str, str, bool, bool]]:
+    """
+    Returns (start_ym, end_ym, open_ended, end_missing)
+    - end_missing=True means we only found a start anchor and must close using next anchor (or keep single-month).
+    """
+    s = line.strip()
+    if not s:
+        return None
+
+    # 1) mm/yyyy range anywhere (incl within parentheses)
+    m = INLINE_MMYYYY_RANGE_RE.search(s)
+    if m:
+        sm, sy, em, ey = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        return f"{sy:04d}-{sm:02d}", f"{ey:04d}-{em:02d}", False, False
+
+    # 2) year range anywhere
+    m = INLINE_YEAR_RANGE_RE.search(s)
+    if m:
+        sy, ey = int(m.group(1)), int(m.group(2))
+        return f"{sy:04d}-01", f"{ey:04d}-12", False, False
+
+    # 3) "(2025)" year-only
+    m = PAREN_SINGLE_YEAR_RE.search(s)
+    if m:
+        y = int(m.group(1))
+        return f"{y:04d}-01", f"{y:04d}-12", False, False
+
+    # 4) single mm/yyyy token -> start-only
+    m = INLINE_SINGLE_MMYYYY_RE.fullmatch(s) or INLINE_SINGLE_MMYYYY_RE.search(s)
+    if m:
+        mm, yy = int(m.group(1)), int(m.group(2))
+        start = f"{yy:04d}-{mm:02d}"
+        return start, start, False, True
+
+    # 5) single yyyy token alone -> start-only
+    if INLINE_SINGLE_YYYY_RE.fullmatch(s):
+        yy = int(s)
+        start = f"{yy:04d}-01"
+        return start, start, False, True
+
+    return None
+
+
+# ----------------------------
+# Tech extraction (unchanged)
 # ----------------------------
 
 TECH_PREFIX_RE = re.compile(
@@ -332,16 +348,12 @@ TECHY_KEYWORDS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ---- NEW: generic EN+DE stopwords / pollution guards for tech tokens ----
 TECH_TOKEN_REJECT_SUBSTRINGS = {
-    # DE
     "beruflicher", "werdegang", "bildung", "ausbildung", "studium",
     "kenntnisse", "fähigkeiten", "sprachen", "zertifikate", "profil",
-    # EN
     "experience", "education", "skills", "languages", "certifications", "profile", "summary",
 }
 
-# headings that may appear inside/around tech lines; remove before splitting
 TECH_HEADING_STRIP_RE = re.compile(
     r"\b(beruflicher\s+werdegang|bildung|ausbildung|studium|kenntnisse|fähigkeiten|"
     r"education|skills|languages|certifications|profile|summary|zusammenfassung|"
@@ -383,7 +395,6 @@ def _parse_tech_block(block_text: str) -> List[str]:
     if not bt:
         return []
 
-    # NEW: strip headings that leak into the block before tokenizing
     bt = TECH_HEADING_STRIP_RE.sub(" ", bt)
     bt = re.sub(r"\s{2,}", " ", bt).strip()
 
@@ -400,7 +411,6 @@ def _parse_tech_block(block_text: str) -> List[str]:
         if not ct:
             continue
         low = ct.lower()
-        # NEW: reject polluted tokens by substring
         if any(bad in low for bad in TECH_TOKEN_REJECT_SUBSTRINGS):
             continue
         tokens.append(ct)
@@ -447,7 +457,6 @@ def extract_technologies_from_lines(lines: List[str]) -> List[str]:
             i += 1
             continue
 
-        # 1) "Eingesetzte Technologien: <stuff>"
         m = TECH_PREFIX_RE.match(ln)
         if m:
             remainder = ln[m.end():].strip()
@@ -467,7 +476,6 @@ def extract_technologies_from_lines(lines: List[str]) -> List[str]:
             i = j
             continue
 
-        # 2) "Eingesetzte Technologien:" alone + wrapped
         if TECH_BLOCK_START_RE.match(ln):
             block_parts: List[str] = []
             j = i + 1
@@ -485,7 +493,6 @@ def extract_technologies_from_lines(lines: List[str]) -> List[str]:
             i = j
             continue
 
-        # 3) Prefix-less comma-heavy stacks (possibly multiple consecutive lines)
         if _looks_like_comma_heavy_stack(ln):
             block_parts = [ln]
             j = i + 1
@@ -516,9 +523,8 @@ def extract_technologies_from_lines(lines: List[str]) -> List[str]:
         if not TECH_TOKEN_OK_RE.match(ct):
             continue
         low = ct.lower()
-        if ct.lower() in {"technologien", "eingesetzte technologien", "tools", "stack"}:
+        if low in {"technologien", "eingesetzte technologien", "tools", "stack"}:
             continue
-        # NEW: reject polluted tokens
         if any(bad in low for bad in TECH_TOKEN_REJECT_SUBSTRINGS):
             continue
         cleaned.append(ct)
@@ -540,7 +546,6 @@ RIGHT_COL_RE = re.compile(r"^\[RIGHT_COLUMN\]\s*(.*)$")
 HEADER_RE = re.compile(r"^\[HEADER_AREA\]\s*(.*)$")
 PAGE_RE = re.compile(r"^---\s*Page\s+\d+\s*---\s*$", re.IGNORECASE)
 
-# NEW: expanded and stronger section break list (stop chunking entirely)
 SECTION_BREAK_RE = re.compile(
     r"""
     ^
@@ -560,11 +565,8 @@ SECTION_BREAK_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
-# DROP location-like single-line city tokens entirely (you said: don't care)
-# Keep it conservative: "Hamburg", "Berlin", "Wien", "München" etc.
 LOCATION_LIKE_RE = re.compile(r"^[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]{2,40}$")
 
-# Heuristic: descriptive lines should be body, not header
 DESC_HINT_RE = re.compile(
     r"\b(beratung|entwicklung|implement|migration|aufbau|konzeption|analyse|"
     r"development|implementation|migration|design|architecture|monitoring|testing|"
@@ -577,14 +579,12 @@ def _looks_like_description(line: str) -> bool:
     s = line.strip()
     if not s:
         return False
-    # long sentences -> likely body
     if len(s) >= 60:
         return True
     if s.count(" ") >= 7:
         return True
     if DESC_HINT_RE.search(s):
         return True
-    # starts with verb-ish bullet missing dash
     if re.match(r"^(Integration|Entwicklung|Implementierung|Migration|Aufbau|Konzeption|Optimierung|Einführung|Weiterentwicklung)\b", s):
         return True
     return False
@@ -596,10 +596,8 @@ def _looks_like_company(line: str) -> bool:
         return False
     if LOCATION_LIKE_RE.match(s):
         return False
-    # company-ish suffixes
     if re.search(r"\b(GmbH|AG|SE|KG|UG|Inc\.?|Ltd\.?|LLC|S\.?A\.?|S\.?r\.?l\.?)\b", s):
         return True
-    # very short, title-case-ish and not a sentence
     if len(s) <= 50 and s.count(" ") <= 6 and not _looks_like_description(s):
         return True
     return False
@@ -618,16 +616,6 @@ class TimelineChunk:
 
 
 def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None) -> List[TimelineChunk]:
-    """
-    Chunker that works with:
-      - tagged lines: [LEFT_COLUMN] 07/2024 bis ...
-      - tagless lines: 07/2024 bis ...
-    Also:
-      - keeps [HEADER_AREA] payload as body (NOT skipped)
-      - ignores RIGHT_COLUMN entirely
-      - NEW: stops chunking when SECTION_BREAK_RE hits
-      - NEW: removes garbage bullet-only lines from body and canonical_text
-    """
     norm = normalize_text(text)
     lines = [ln.rstrip("\n") for ln in norm.splitlines()]
 
@@ -647,20 +635,30 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
     def is_right_column_line(raw_line: str) -> bool:
         return bool(RIGHT_COL_RE.match(raw_line.strip()))
 
-    def parse_anchor(candidate: str) -> Optional[Tuple[str, str, bool]]:
+    def parse_anchor(candidate: str) -> Optional[Tuple[str, str, bool, bool]]:
         """
-        Returns (start_ym, end_ym, open_ended)
+        Returns (start_ym, end_ym, open_ended, end_missing)
         """
-        sp = parse_start_from_payload(candidate)
-        if sp:
-            start_ym, open_ended = sp
-            end_ym = asof or start_ym
-            return start_ym, end_ym, open_ended
+        # NEW: anchors anywhere in line (e.g. "Project (2019 - 2024)")
+        anywhere = find_date_anchor_anywhere(candidate, asof=asof)
+        if anywhere:
+            return anywhere
 
+        # strict range lines
         rng = parse_date_range(candidate, asof=asof)
         if rng:
             start_ym, end_ym = rng
-            return start_ym, end_ym, False
+            open_ended = bool(PRESENT_RE.search(candidate)) or bool(SINCE_RE.match(candidate))
+            return start_ym, end_ym, open_ended, False
+
+        # start-payload "07/2024 bis ..." (end may be on following line)
+        sp = parse_start_from_payload(candidate)
+        if sp:
+            start_ym, open_ended = sp
+            if open_ended:
+                return start_ym, (asof or start_ym), True, False
+            # end missing -> try to read end from next date-ish line; else close via next anchor
+            return start_ym, start_ym, False, True
 
         return None
 
@@ -678,7 +676,6 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 
         candidate = strip_any_tag(raw)
 
-        # NEW: global stop once we hit non-experience sections
         if SECTION_BREAK_RE.match(candidate):
             break
 
@@ -687,11 +684,11 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
             i += 1
             continue
 
-        start_ym, end_ym, open_ended = anchor
+        start_ym, end_ym, open_ended, end_missing = anchor
 
-        # If this was "07/2024 bis" (no inline end), read end date from following date-ish line
+        # If end is missing (e.g. "07/2024 bis" or "4/2006"), try to read an explicit end on following line(s)
         j = i + 1
-        if not open_ended and parse_date_range(candidate, asof=asof) is None:
+        if end_missing and not open_ended:
             while j < len(lines):
                 raw_j = lines[j].strip()
 
@@ -704,12 +701,11 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 
                 cand_j = strip_any_tag(raw_j)
 
-                # NEW: stop if section break starts
                 if SECTION_BREAK_RE.match(cand_j):
                     break
 
-                # stop if next anchor starts
-                if parse_start_from_payload(cand_j):
+                # stop if next anchor starts (don’t consume it)
+                if parse_anchor(cand_j):
                     break
 
                 end_tok = parse_date_token(cand_j)
@@ -718,11 +714,13 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 
                 if end_tok:
                     end_ym = end_tok
+                    end_missing = False
                     j += 1
                     break
 
                 if PRESENT_RE.search(cand_j):
                     end_ym = asof or start_ym
+                    end_missing = False
                     j += 1
                     break
 
@@ -745,7 +743,6 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 
             cand_k = strip_any_tag(raw_k)
 
-            # NEW: stop collecting / stop chunking when section breaks
             if SECTION_BREAK_RE.match(cand_k):
                 break
             if parse_anchor(cand_k):
@@ -758,7 +755,6 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
                 k += 1
                 continue
 
-            # DROP location-ish lines entirely
             if LOCATION_LIKE_RE.match(cand_k):
                 k += 1
                 continue
@@ -766,7 +762,25 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
             collected_lines.append(cand_k)
             k += 1
 
-        # Header/body: company + optional role/title; everything descriptive goes body
+        # NEW: if end is still missing, close chunk to month before next anchor start (if any)
+        if end_missing and k < len(lines):
+            next_cand = strip_any_tag(lines[k].strip())
+            nxt = parse_anchor(next_cand)
+            if nxt:
+                next_start_ym = nxt[0]
+                y, m = map(int, next_start_ym.split("-"))
+                if m == 1:
+                    end_ym = f"{y-1:04d}-12"
+                else:
+                    end_ym = f"{y:04d}-{m-1:02d}"
+                end_missing = False
+
+        # Still missing? Keep single-month (safer than exploding to asof)
+        if end_missing:
+            end_ym = start_ym
+            end_missing = False
+
+        # Header/body split
         header_lines: List[str] = []
         body_lines: List[str] = []
 
@@ -776,36 +790,29 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
             if LOCATION_LIKE_RE.match(ln):
                 continue
 
-            # normalize bullets to "- ..." and drop bullet-only
             if ln.startswith("-") or ln.startswith("•"):
-                # normalize bullet to "- ..." and drop bullet-only lines
                 cleaned = ln.lstrip("•").strip()
                 if _is_garbage_line(cleaned):
                     continue
                 body_lines.append(cleaned if cleaned.startswith("-") else "- " + cleaned)
                 continue
 
-            # tech header line belongs to body
             if TECH_HEADER_STOP_RE.match(ln):
                 body_lines.append(ln)
                 continue
 
-            # prefer company as first header line if it looks like company
             if not header_lines and _looks_like_company(ln) and not _looks_like_description(ln):
                 header_lines.append(ln)
                 continue
 
-            # optional role/title line (short, not a sentence)
             if len(header_lines) == 1 and not body_lines:
                 if not _looks_like_description(ln) and len(ln) <= 60 and ln.count(" ") <= 8:
                     header_lines.append(ln)
                     continue
 
-            # otherwise: body
             body_lines.append(ln)
 
-        # canonical text
-        canonical_parts = []
+        canonical_parts: List[str] = []
         canonical_parts.extend([x for x in header_lines if x and not _is_garbage_line(x)])
         canonical_parts.extend([x for x in body_lines if x and not _is_garbage_line(x)])
         canonical_text = "\n".join(canonical_parts).strip()
@@ -830,7 +837,6 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 
         i = k
 
-        # NEW: if we stopped because section break, stop timeline chunking completely
         if i < len(lines):
             nxt = strip_any_tag(lines[i].strip())
             if SECTION_BREAK_RE.match(nxt):
@@ -844,10 +850,6 @@ def chunk_timeline_from_extracted_text(text: str, *, asof: Optional[str] = None)
 # ----------------------------
 
 def aggregate_tech_months(chunks: List[TimelineChunk]) -> Dict[str, int]:
-    """
-    Pragmatic rule:
-    If a technology appears in a chunk, count the full chunk duration for that technology.
-    """
     totals: Dict[str, int] = {}
     for ch in chunks:
         for tech in ch.technologies:
@@ -860,12 +862,6 @@ def aggregate_tech_months(chunks: List[TimelineChunk]) -> Dict[str, int]:
 # ----------------------------
 
 def extract_timeline_tech_and_totals(text: str, *, asof: Optional[str] = None) -> Dict[str, object]:
-    """
-    Final output:
-      - chunks[] each includes months + extracted tech list + canonical_text
-      - tech_months: aggregated totals across chunks
-      - asof_used: actual YYYY-MM used for open-ended ranges
-    """
     asof_used = asof or default_asof()
     chunks = chunk_timeline_from_extracted_text(text, asof=asof_used)
     tech_months = aggregate_tech_months(chunks)
@@ -885,37 +881,34 @@ if __name__ == "__main__":
     SAMPLE = r"""
 --- Page 1 ---
 
-[LEFT_COLUMN] 07/2024 bis
-[LEFT_COLUMN] 02/2025
-50Hertz Transmission GmbH
-Beratung und Entwicklung in der agilen Produktentwicklung über alle Phasen
-Hamburg
-•
-Integration von Microservices auf Basis von Java
--
-Eingesetzte Technologien: Java 21, Python 3.10, Kubernetes
-
---- Page 2 ---
-
-[LEFT_COLUMN] 04/2024 bis
-[LEFT_COLUMN] 06/2024
-Adobe Systems Engineering GmbH
-Hamburg
-Implementierung von Cloud-Infrastruktur mit Amazon Web Services (AWS)
+SCOBEES - FULLSTACK ENTWICKLUNG (2025)
+Scobees GmbH, Köln
+Aufgabenbereich:
+FullStack Software Entwicklung - Schwerpunkt Backend (NestJS)
 Eingesetzte Technologien:
-AWS, Terraform, OpenStack Beruflicher Werdegang
+NodeJS 20, Typescript, NestJS 10, TypeORM / Postgres, Angular 20
+
+SAMSON D41 - FULLSTACK ENTWICKLUNG (2024 - 2025)
+Peak One GmbH, Hamburg
+Team Mitglied in der Webentwicklung und Verantwortlichkeit für eine der zentralen API’s (Microservice).
+Eingesetzte Technologien:
+NodeJS 20, Typescript, Angular, AWS Cloud (ECS / Kubernetes), MongoDB / DocumentDB
+
+4/2006
+Technik Vorstand (CTO)
+Netempire AG, Köln
+Aufgabenbereich:
+Beratung, technisches Projektmanagement und komplexe Software Entwicklung.
 
 Bildung
 Master of Science ...
 """
-
     result = extract_timeline_tech_and_totals(SAMPLE, asof="2025-12")
     for idx, ch in enumerate(result["chunks"], 1):
         print(f"\n== Chunk {idx} ==")
         print(ch["start_date"], "->", ch["end_date"], f"({ch['months']} months)")
         print("HEADER:", ch["header_lines"])
         print("BODY:", ch["body_lines"])
-        print("CANONICAL:\n", ch["canonical_text"])
         print("TECH:", ch["technologies"])
 
     print("\n== Aggregated tech months ==")
