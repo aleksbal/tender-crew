@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
+from typing import Dict, List, Tuple, Optional, Callable
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
 
 import fitz  # pymupdf
 from docx import Document
@@ -334,24 +335,56 @@ def _maybe_reorder_two_columns(line_objs: List[Dict], page_width: float, mode: s
     return left_sorted + right_sorted
 
 
-
-def _words_to_line_objects(words) -> List[Dict]:
+def _words_to_line_objects(
+    words,
+    *,
+    debug: bool = False,
+    debug_sink: Optional[Callable[[str], None]] = None,
+) -> List[Dict]:
     """
-    Production-ish: build lines by (block_no, line_no) from PyMuPDF words.
+    Build lines by (block_no, line_no) from PyMuPDF words.
     words tuple: (x0, y0, x1, y1, "word", block_no, line_no, word_no)
-    This avoids y-tolerance heuristics entirely.
+
+    Debug mode:
+      - debug=True enables logging of spacing decisions
+      - debug_sink is a callable (e.g., logger.info / print). Defaults to print.
     """
+
+    sink = debug_sink or print
+
+    def dlog(msg: str) -> None:
+        if debug:
+            sink(msg)
+
+    def _median(vals: List[float]) -> Optional[float]:
+        if not vals:
+            return None
+        s = sorted(vals)
+        n = len(s)
+        mid = n // 2
+        if n % 2:
+            return float(s[mid])
+        return 0.5 * (float(s[mid - 1]) + float(s[mid]))
+
+    def _is_single_letter_alpha(token: str) -> bool:
+        t = unicodedata.normalize("NFC", token.strip())
+        return len(t) == 1 and t.isalpha()
+
+    def _ends_with_alpha(s: str) -> bool:
+        if not s:
+            return False
+        return s[-1].isalpha()
+
     # group words by (block_no, line_no)
-    groups: Dict[tuple, List[tuple]] = {}
+    groups: Dict[Tuple[int, int], List[tuple]] = {}
     for w in words:
         if len(w) < 8:
-            # Defensive: unexpected format
             continue
-        x0, y0, x1, y1, text, block_no, line_no, word_no = w[:8]
+        _x0, _y0, _x1, _y1, _text, block_no, line_no, _word_no = w[:8]
         key = (int(block_no), int(line_no))
         groups.setdefault(key, []).append(w)
 
-    # Sort lines top-to-bottom using min y0 of the group, then min x0
+    # Sort lines top-to-bottom using min y0 of group, then min x0
     line_items = []
     for key, ws in groups.items():
         min_y0 = min(w[1] for w in ws)
@@ -360,19 +393,50 @@ def _words_to_line_objects(words) -> List[Dict]:
     line_items.sort(key=lambda t: (t[0], t[1]))
 
     out: List[Dict] = []
-    for _min_y0, _min_x0, _key, ws in line_items:
-        # sort words left-to-right using word_no then x0 (word_no usually stable)
+
+    for line_idx, (_min_y0, _min_x0, key, ws) in enumerate(line_items):
         ws.sort(key=lambda w: (int(w[7]), w[0]))
 
+        # Compute per-line median positive gap
+        gaps: List[float] = []
+        for i in range(1, len(ws)):
+            prev_x1 = float(ws[i - 1][2])
+            cur_x0 = float(ws[i][0])
+            g = cur_x0 - prev_x1
+            if g > 0:
+                gaps.append(g)
+
+        med_gap = _median(gaps)
+        space_threshold = (0.6 * med_gap) if (med_gap is not None and med_gap > 0) else 2.0
+
+        # For debug: show line meta
+        if debug:
+            # create a compact preview (raw tokens) to locate problematic lines
+            toks_preview = []
+            for w in ws[:16]:
+                t = re.sub(r"\s+", " ", (w[4] or "").strip())
+                if t:
+                    toks_preview.append(t)
+            preview = " ".join(toks_preview)
+            if len(ws) > 16:
+                preview += " …"
+            dlog(
+                f"[line {line_idx} key={key}] tokens={len(ws)} "
+                f"med_gap={med_gap!r} threshold={space_threshold:.3f} "
+                f"preview='{preview}'"
+            )
+
         parts: List[str] = []
-        prev_x1 = None
+        prev_x1: Optional[float] = None
 
         min_x0 = float("inf")
         min_y0 = float("inf")
         max_x1 = float("-inf")
         max_y1 = float("-inf")
 
-        for (x0, y0, x1, y1, text, *_rest) in ws:
+        for wi, (x0, y0, x1, y1, text, *_rest) in enumerate(ws):
+            x0 = float(x0); y0 = float(y0); x1 = float(x1); y1 = float(y1)
+
             min_x0 = min(min_x0, x0)
             min_y0 = min(min_y0, y0)
             max_x1 = max(max_x1, x1)
@@ -384,9 +448,35 @@ def _words_to_line_objects(words) -> List[Dict]:
 
             if prev_x1 is None:
                 parts.append(t)
-            else:
-                gap = x0 - prev_x1
-                parts.append((" " if gap > 1.5 else "") + t)
+                prev_x1 = x1
+                continue
+
+            gap = x0 - prev_x1
+            prev_text = parts[-1] if parts else ""
+
+            # Decide whether to insert a space
+            rule_single_letter_continuation = (
+                _is_single_letter_alpha(t)
+                and _ends_with_alpha(prev_text)
+                and gap < (space_threshold * 1.15)
+            )
+
+            insert_space = (gap >= space_threshold) and (not rule_single_letter_continuation)
+
+            if debug:
+                # log only "interesting" cases by default:
+                # - single-letter rule triggered
+                # - gap is near threshold
+                near = abs(gap - space_threshold) <= max(0.75, 0.25 * space_threshold)
+                if rule_single_letter_continuation or near:
+                    dlog(
+                        f"  wi={wi:02d} prev='{prev_text[-24:]}' token='{t}' "
+                        f"gap={gap:.3f} thr={space_threshold:.3f} "
+                        f"single_letter_rule={rule_single_letter_continuation} "
+                        f"space={'Y' if insert_space else 'N'}"
+                    )
+
+            parts.append((" " if insert_space else "") + t)
             prev_x1 = x1
 
         line_text = "".join(parts).strip()
@@ -394,5 +484,7 @@ def _words_to_line_objects(words) -> List[Dict]:
             out.append({"bbox": [min_x0, min_y0, max_x1, max_y1], "text": line_text})
 
     return out
+
+
 
 
