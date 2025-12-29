@@ -737,35 +737,3 @@ def postprocess_cv_json(json_obj: Dict[str, Any]) -> Dict[str, Any]:
             l["proficiency"] = _normalize_text_block(l.get("proficiency", ""))
 
     return cv
-
-
-# =============================================================================
-# CLI quick test
-# =============================================================================
-
-if __name__ == "__main__":
-    import argparse
-    import pathlib
-    import sys
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("raw_text_file", help="Path to extracted raw text file")
-    ap.add_argument("--debug", action="store_true", help="Print debug events")
-    ap.add_argument("--snapshots", action="store_true", help="Include debug snapshots")
-    args = ap.parse_args()
-
-    p = pathlib.Path(args.raw_text_file)
-    raw = p.read_text(encoding="utf-8", errors="replace")
-
-    if args.debug:
-        norm, events, snaps = normalize_cv_text(raw, debug=True, keep_snapshots=args.snapshots)  # type: ignore
-        print(norm)
-        print("\n--- DEBUG EVENTS ---")
-        for e in events:
-            print(e)
-        if args.snapshots:
-            print("\n--- SNAPSHOTS ---")
-            for k, v in snaps.items():
-                print(f"\n### {k}\n{v[:2000]}\n...")
-    else:
-        print(normalize_cv_text(raw))

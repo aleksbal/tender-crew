@@ -144,8 +144,6 @@ def main(argv=None):
 
         logger.info("Generating output...")
 
-        out = postprocess_cv_json(out)
-
         data = json.dumps(out, ensure_ascii=False, indent=2)
         if args.out:
             logger.info(f"Writing output to: {args.out}")
