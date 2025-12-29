@@ -10,7 +10,7 @@ def test_llm_kind_flag_uses_factory(monkeypatch, tmp_path):
         def __init__(self):
             self.generated = False
 
-        def generate_structured(self, structured, schema_path=None, model=None, max_length=None, max_retries=None):
+        def generate_structured(self, document_text: str):
             self.generated = True
             return json.dumps({"ok": True})
 

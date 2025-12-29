@@ -88,18 +88,16 @@ def main(argv=None):
                 client = create_llm_client(
                     kind=args.llm_kind,
                     system_prompt_path=args.system_prompt,
-                    user_prompt_path=args.user_prompt
-                )
-                logger.info(f"LLM client created: {type(client).__name__}")
-                
-                logger.info("Calling LLM to generate structured output...")
-                llm_response = client.generate_structured(
-                    text_for_json,
+                    user_prompt_path=args.user_prompt,
                     schema_path=args.schema,
                     model=args.llm_model,
                     max_length=4096,
                     max_retries=3,
                 )
+                logger.info(f"LLM client created: {type(client).__name__}")
+                
+                logger.info("Calling LLM to generate structured output...")
+                llm_response = client.generate_structured(text_for_json)
                 logger.info("LLM processing completed successfully")
             except Exception as e:
                 logger.error(f"LLM call failed: {e}", exc_info=True)
@@ -113,6 +111,7 @@ def main(argv=None):
                 llm_json = json.loads(llm_response)
                 out = llm_json
                 logger.info("Using LLM-generated JSON as primary output")
+                logger.info(out)
             except json.JSONDecodeError:
                 # If LLM failed, fall back to raw data and include error
                 logger.warning("LLM response is not valid JSON, using raw extracted data")

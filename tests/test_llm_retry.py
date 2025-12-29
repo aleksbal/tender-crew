@@ -16,7 +16,7 @@ def test_generate_structured_retries(monkeypatch, tmp_path):
             if not self.user_prompt_template:
                 self.user_prompt_template = "DOCUMENT TEXT: {DOCUMENT_TEXT}\nJSON SCHEMA: {SCHEMA_TEXT}"
 
-        def _call_llm_api(self, user_prompt: str, model: str = None, max_length: int = None) -> str:
+        def _call_llm_api(self, user_prompt: str) -> str:
             self.call_count += 1
             # first call -> invalid JSON
             if self.call_count == 1:

@@ -4,7 +4,7 @@ Provides a simple interface to call LLM providers (Ollama, OpenAI) for
 single query/response transformations. Not conversational - just sends
 system and user prompts and returns the JSON response.
 """
-from typing import Optional, Dict
+from typing import Optional
 import requests
 import os
 import json
@@ -22,9 +22,9 @@ except Exception:
 
 
 class LLMClient:
-    def __init__(self, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None):
+    def __init__(self, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None, schema_path: str | Path | None = None, model: str = "ollama/llama2", max_length: int = 8192, max_retries: int = 3):
         """
-        Initialize LLM client with system prompt and user prompt template.
+        Initialize LLM client with system prompt, user prompt templates, as well as JSON schema path.
         Both are loaded once at construction time since they never change.
         """
         # Load system prompt
@@ -46,8 +46,14 @@ class LLMClient:
                 logger.info(f"Loaded user prompt template from: {upath}")
             else:
                 logger.warning(f"User prompt template file not found: {upath}")
+        
+        # Store instance-specific parameters
+        self.schema_path = schema_path
+        self.model = model
+        self.max_length = max_length
+        self.max_retries = max_retries
     
-    def _call_llm_api(self, user_prompt: str, model: str, max_length: int = 4096) -> str:
+    def _call_llm_api(self, user_prompt: str) -> str:
         """
         Internal method to call the LLM API with system and user prompts.
         Implemented by subclasses.
@@ -57,10 +63,6 @@ class LLMClient:
     def generate_structured(
         self,
         document_text: str,
-        schema_path: str | Path | None = None,
-        model: str = "ollama/llama2",
-        max_length: int = 4096,
-        max_retries: int = 3,
     ) -> str:
         """
         Extract structured data from CV/resume and convert to JSON using LLM.
@@ -71,8 +73,8 @@ class LLMClient:
         # Load schema
         schema_text = ""
         schema = None
-        if schema_path:
-            sp = Path(schema_path)
+        if self.schema_path:
+            sp = Path(self.schema_path)
             if sp.exists():
                 schema_text = sp.read_text(encoding="utf-8")
                 try:
@@ -80,18 +82,9 @@ class LLMClient:
                 except Exception:
                     schema = None
             else:
-                logger.warning(f"Schema file not found: {schema_path}")
+                logger.warning(f"Schema file not found: {self.schema_path}")
 
         logger.info(f"Extracted document text for LLM (length: {len(document_text)} characters)")
-        logger.info("=" * 80)
-        logger.info("CV TEXT BEING SENT TO LLM:")
-        logger.info("=" * 80)
-        # Log the document text (truncate if too long for readability)
-        if len(document_text) > 5000:
-            logger.info(f"{document_text}...\n[Total length: {len(document_text)} characters]")
-        else:
-            logger.info(document_text)
-        logger.info("=" * 80)
         
         # Load user prompt template and replace placeholders with schema and document text
         if not self.user_prompt_template:
@@ -105,15 +98,14 @@ class LLMClient:
         attempt = 0
         last_error = None
         
-        logger.info(f"Starting LLM generation (max_retries={max_retries})")
-        logger.info(f"Document text length: {len(document_text)} characters")
+        logger.info(f"Starting LLM generation (max_retries={self.max_retries})")
 
-        while attempt < max_retries:
+        while attempt < self.max_retries:
             attempt += 1
-            logger.info(f"Attempt {attempt}/{max_retries} - Calling LLM with model: {model}")
+            logger.info(f"Attempt {attempt}/{self.max_retries} - Calling LLM with model: {self.model}")
             try:
                 # Call LLM API with system prompt (loaded in constructor) and user prompt
-                raw = self._call_llm_api(user_prompt, model=model, max_length=max_length)
+                raw = self._call_llm_api(user_prompt)
                 logger.info(f"Received response (length: {len(raw)} characters)")
                 last_response = raw
             except RuntimeError as e:
@@ -121,11 +113,11 @@ class LLMClient:
                 raise
             except Exception as e:
                 last_error = e
-                if attempt < max_retries:
+                if attempt < self.max_retries:
                     time.sleep(0.5 * attempt)  # Exponential backoff
                     continue
                 else:
-                    raise RuntimeError(f"LLM generate failed after {max_retries} attempts: {e}") from e
+                    raise RuntimeError(f"LLM generate failed after {self.max_retries} attempts: {e}") from e
 
             parsed = None
             try:
@@ -142,16 +134,16 @@ class LLMClient:
 
             if parsed is None:
                 logger.warning(f"Attempt {attempt}: Failed to parse JSON from response")
-                if attempt < max_retries:
+                if attempt < self.max_retries:
                     # ask the model to return only corrected JSON on next attempt
                     user_prompt += "\n\nPlease output only a single JSON object that conforms to the provided schema. Do not include any explanatory text."
-                    last_error = ValueError(f"LLM did not return valid JSON (attempt {attempt}/{max_retries})")
+                    last_error = ValueError(f"LLM did not return valid JSON (attempt {attempt}/{self.max_retries})")
                     logger.info(f"Retrying with updated prompt...")
                     time.sleep(0.5 * attempt)
                     continue
                 else:
                     raise RuntimeError(
-                        f"LLM did not return valid JSON after {max_retries} attempts. "
+                        f"LLM did not return valid JSON after {self.max_retries} attempts. "
                         f"Last response (first 500 chars): {last_response[:500] if last_response else 'None'}"
                     )
 
@@ -166,7 +158,7 @@ class LLMClient:
                 except ValidationError as e:
                     error_msg = e.message if hasattr(e, 'message') else str(e)
                     logger.warning(f"Attempt {attempt}: Schema validation failed: {error_msg}")
-                    if attempt < max_retries:
+                    if attempt < self.max_retries:
                         user_prompt += f"\n\nThe previous JSON did not validate: {error_msg}. Please produce a corrected JSON only."
                         last_error = e
                         logger.info(f"Retrying with validation error feedback...")
@@ -174,7 +166,7 @@ class LLMClient:
                         continue
                     else:
                         raise RuntimeError(
-                            f"LLM response did not validate against schema after {max_retries} attempts. "
+                            f"LLM response did not validate against schema after {self.max_retries} attempts. "
                             f"Last validation error: {e.message if hasattr(e, 'message') else str(e)}"
                         ) from e
 
@@ -182,27 +174,27 @@ class LLMClient:
 
         # If we get here, all attempts failed
         if last_error is not None:
-            raise RuntimeError(f"LLM generate_structured failed after {max_retries} attempts: {last_error}") from last_error
-        raise RuntimeError(f"LLM generate_structured failed after {max_retries} attempts without specific error")
+            raise RuntimeError(f"LLM generate_structured failed after {self.max_retries} attempts: {last_error}") from last_error
+        raise RuntimeError(f"LLM generate_structured failed after {self.max_retries} attempts without specific error")
 
 
 class OllamaClient(LLMClient):
-    def __init__(self, url: Optional[str] = None, timeout: int = 60, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None):
+    def __init__(self, url: Optional[str] = None, timeout: int = 60, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None, schema_path: str | Path | None = None, model: str = "ollama/llama2", max_length: int = 8192, max_retries: int = 3):
         # Initialize base class with system prompt and user prompt template
-        super().__init__(system_prompt_path=system_prompt_path, user_prompt_path=user_prompt_path)
+        super().__init__(system_prompt_path=system_prompt_path, user_prompt_path=user_prompt_path, schema_path=schema_path, model=model, max_length=max_length, max_retries=max_retries)
         # Default local Ollama HTTP API endpoint
         base_url = url or "http://127.0.0.1:11434"
         self.generate_url = f"{base_url}/api/generate"
         self.timeout = timeout
 
-    def _call_llm_api(self, user_prompt: str, model: str = "ollama/llama2", max_length: int = 8192) -> str:
-        model_name = model.replace("ollama/", "") if model.startswith("ollama/") else model
+    def _call_llm_api(self, user_prompt: str) -> str:
+        model_name = self.model.replace("ollama/", "") if self.model.startswith("ollama/") else self.model
 
         body = {
             "model": model_name,
             "prompt": user_prompt,
             "stream": False,
-            "num_predict": max_length,
+            "num_predict": self.max_length,
             **({"system": self.system_prompt} if self.system_prompt else {}),
             "format": "json",
             "options": {
@@ -243,9 +235,9 @@ def create_llm_client(kind: str = "ollama", system_prompt_path: str | Path | Non
 
 
 class OpenAIClient(LLMClient):
-    def __init__(self, api_key: Optional[str] = None, timeout: int = 60, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None):
+    def __init__(self, api_key: Optional[str] = None, timeout: int = 60, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None, schema_path: str | Path | None = None, model: str = "gpt-4o-mini", max_length: int = 2048, max_retries: int = 3):
         # Initialize base class with system prompt and user prompt template
-        super().__init__(system_prompt_path=system_prompt_path, user_prompt_path=user_prompt_path)
+        super().__init__(system_prompt_path=system_prompt_path, user_prompt_path=user_prompt_path, schema_path=schema_path, model=model, max_length=max_length, max_retries=max_retries)
         if openai is None:
             raise RuntimeError("openai package not available")
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
@@ -267,7 +259,7 @@ class OpenAIClient(LLMClient):
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OpenAI client: {e}") from e
 
-    def _call_llm_api(self, user_prompt: str, model: str = "gpt-4o-mini", max_length: int = 2048) -> str:
+    def _call_llm_api(self, user_prompt: str) -> str:
         try:
             # Build messages with system prompt (loaded in constructor) and user prompt
             messages = []
@@ -278,17 +270,17 @@ class OpenAIClient(LLMClient):
             if self.use_client_api:
                 # Modern OpenAI SDK (v1.0+)
                 response = self.client.chat.completions.create(
-                    model=model,
+                    model=self.model,
                     messages=messages,
-                    max_tokens=max_length,
+                    max_tokens=self.max_length,
                 )
                 return response.choices[0].message.content
             else:
                 # Legacy OpenAI SDK (< v1.0)
                 resp = openai.ChatCompletion.create(
-                    model=model,
+                    model=self.model,
                     messages=messages,
-                    max_tokens=max_length,
+                    max_tokens=self.max_length,
                 )
                 return resp.choices[0].message.content
         except Exception as e:
