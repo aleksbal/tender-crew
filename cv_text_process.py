@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union

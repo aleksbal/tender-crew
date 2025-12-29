@@ -7,9 +7,8 @@ import subprocess
 from typing import Optional
 from pathlib import Path
 
-from cv_text_extractor import extract_text_structured
 from llm_client import create_llm_client
-from converter import convert_input
+from mymupdf_extractor import extract_plain_text
 
 # Configure logging
 logging.basicConfig(
@@ -49,45 +48,40 @@ def main(argv=None):
     logger.info(f"Processing file: {src}")
     
     try:
-        # delegate conversion / preprocessing to converter component
-        logger.info("Converting/preprocessing input file...")
-        conv = convert_input(str(src), pandoc_ast=args.pandoc_ast)
-        work_path = conv.get("work_path", src)
-        tmp_files = conv.get("tmp_files", [])
-        pandoc_ast = conv.get("pandoc_ast")
 
-        logger.info("Extracting structured text...")
-        structured, diag = extract_text_structured(str(work_path))
-        logger.info(f"Extracted {len(structured.get('pages', []))} page(s)")
-        
+        logger.info("Starting conversion...")
+
+        text_for_json = extract_plain_text(src)
+
         # Apply redaction only if --redact flag is set
         if args.redact:
             logger.info("Redacting PII using header-based approach...")
-            from redactor import redact_structured_header_only
-            redacted_struct, redactions = redact_structured_header_only(structured)
-            logger.info(f"Applied {len(redactions)} redaction(s) - removed header section")
         else:
             logger.info("PII redaction skipped (use --redact to enable)")
-            redacted_struct = structured
-            redactions = []
 
         llm_response = None
         if args.llm:
             logger.info("Starting LLM processing...")
             logger.info(f"LLM kind: {args.llm_kind}, model: {args.llm_model}")
             
-            spath = Path(args.system_prompt)
-            schema_path = Path(args.schema)
+            sys_prompt_path = Path(args.system_prompt)
+            usr_prompt_path = Path(args.user_prompt)
+            json_schema_path = Path(args.schema)
             
-            if not spath.exists():
-                logger.warning(f"System prompt file not found: {spath}")
+            if not sys_prompt_path.exists():
+                logger.warning(f"System prompt file not found: {sys_prompt_path}")
             else:
-                logger.info(f"Using system prompt: {spath}")
-                
-            if not schema_path.exists():
-                logger.warning(f"Schema file not found: {schema_path}")
+                logger.info(f"Using system prompt: {sys_prompt_path}")
+
+            if not usr_prompt_path.exists():
+                logger.warning(f"User prompt file not found: {sys_prompt_path}")
             else:
-                logger.info(f"Using schema: {schema_path}")
+                logger.info(f"Using user prompt: {usr_prompt_path}")
+
+            if not json_schema_path.exists():
+                logger.warning(f"Schema file not found: {json_schema_path}")
+            else:
+                logger.info(f"Using schema: {json_schema_path}")
             
             try:
                 logger.info("Creating LLM client...")
@@ -100,7 +94,7 @@ def main(argv=None):
                 
                 logger.info("Calling LLM to generate structured output...")
                 llm_response = client.generate_structured(
-                    redacted_struct,
+                    text_for_json,
                     schema_path=args.schema,
                     model=args.llm_model,
                     max_length=4096,
@@ -122,48 +116,13 @@ def main(argv=None):
             except json.JSONDecodeError:
                 # If LLM failed, fall back to raw data and include error
                 logger.warning("LLM response is not valid JSON, using raw extracted data")
-                out = {
-                    "structured": redacted_struct,
-                    "diagnostics": diag.__dict__ if hasattr(diag, "__dict__") else {},
-                    "redactions": redactions,
-                    "llm_error": llm_response,
-                }
-                if pandoc_ast is not None:
-                    out["pandoc_ast"] = pandoc_ast
         else:
-            # No LLM processing - output raw extracted data
-            out = {
-                "structured": redacted_struct,
-                "diagnostics": diag.__dict__ if hasattr(diag, "__dict__") else {},
-                "redactions": redactions,
-            }
-            if pandoc_ast is not None:
-                out["pandoc_ast"] = pandoc_ast
+            logger.info("LLM responds with no valid JSON")
 
-        logger.info("Generating output...")
-
-        data = json.dumps(out, ensure_ascii=False, indent=2)
-        if args.out:
-            logger.info(f"Writing output to: {args.out}")
-            with open(args.out, "w", encoding="utf-8") as fh:
-                fh.write(data)
-        else:
-            print(data)
-
-        if llm_response is not None:
-            print('\n---- LLM response (also in output file) ----')
-            print(llm_response)
-            
-        logger.info("Processing completed successfully")
 
     finally:
         # cleanup tmp files
-        for t in tmp_files:
-            try:
-                Path(t).unlink()
-            except Exception:
-                pass
-
+        logger.info("Processing completed successfully")
 
 if __name__ == "__main__":
     main()

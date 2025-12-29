@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# ---- import your modules ----
-import cv_text_extractor as tex
 
 # NOTE: adapt this import if your filename differs
-import cv_timeline_chunker as tchunk
-
+import cv_deterministic_processor as tchunk
+from mymupdf_extractor import extract_plain_text
 
 # =============================================================================
 # Configuration: one place to plug your chunker function name
@@ -493,9 +491,9 @@ def run_chunker(plain_text: str, *, asof: Optional[str] = None) -> Dict[str, Any
 # Final orchestrator
 # =============================================================================
 
-def process_cv(path: str, *, include_raw_text: bool = False, raw_text_max_chars: int = 30000, asof: Optional[str] = None) -> Dict[str, Any]:
-    structured, diag = tex.extract_text_structured(path)
-    plain = tex.extract_text_plain(structured)
+def convert_deterministic(path: str, *, include_raw_text: bool = False, raw_text_max_chars: int = 30000, asof: Optional[str] = None) -> Dict[str, Any]:
+
+    plain = extract_plain_text(Path(path))
 
     # Chunker + tech totals
     chunker_out = run_chunker(plain, asof=asof)
@@ -514,13 +512,6 @@ def process_cv(path: str, *, include_raw_text: bool = False, raw_text_max_chars:
 
     # Quality report
     quality = {
-        "extractor_diagnostics": {
-            "file_type": diag.file_type,
-            "pages": diag.pages,
-            "rejected_scanned_pdf": diag.rejected_scanned_pdf,
-            "multi_column_pages": diag.multi_column_pages,
-            "empty_text_pages": diag.empty_text_pages,
-        },
         "pipeline_flags": {
             "has_timeline_chunks": bool(chunker_out.get("chunks")),
             "has_tech_months": bool(tech_months),
@@ -542,7 +533,6 @@ def process_cv(path: str, *, include_raw_text: bool = False, raw_text_max_chars:
 
     final: Dict[str, Any] = {
         "source_file": os.path.basename(path),
-        "file_type": diag.file_type,
         "asof_used": chunker_out.get("asof_used", asof or default_asof()),
         "core_profile": core_profile,
         "timeline_chunks": chunker_out.get("chunks", []),
@@ -572,9 +562,9 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python cv_final_json.py /path/to/cv.pdf|cv.docx")
+        print("Usage: python cv_converter_service.py /path/to/cv.pdf|cv.docx")
         raise SystemExit(2)
 
     p = sys.argv[1]
-    out = process_cv(p, include_raw_text=False)
+    out = convert_deterministic(p, include_raw_text=False)
     print(json.dumps(out, ensure_ascii=False, indent=2))

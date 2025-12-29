@@ -13,8 +13,6 @@ import time
 from pathlib import Path
 from jsonschema import ValidationError
 
-from cv_text_extractor import extract_text_plain
-
 logger = logging.getLogger(__name__)
 
 try:
@@ -58,7 +56,7 @@ class LLMClient:
 
     def generate_structured(
         self,
-        structured: Dict,
+        document_text: str,
         schema_path: str | Path | None = None,
         model: str = "ollama/llama2",
         max_length: int = 4096,
@@ -84,8 +82,6 @@ class LLMClient:
             else:
                 logger.warning(f"Schema file not found: {schema_path}")
 
-        # Extract readable text from structured data
-        document_text = extract_text_plain(structured)
         logger.info(f"Extracted document text for LLM (length: {len(document_text)} characters)")
         logger.info("=" * 80)
         logger.info("CV TEXT BEING SENT TO LLM:")
