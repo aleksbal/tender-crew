@@ -1,0 +1,25 @@
+Extract and structure the following CV/resume document according to the JSON schema provided. Return exactly ONE JSON object.
+
+DOCUMENT TEXT:
+{DOCUMENT_TEXT}
+
+DOCUMENT STRUCTURE HINTS:
+- [HEADER_AREA] markers indicate text in the top portion of the page (may be redacted)
+- [LEFT_COLUMN] and [RIGHT_COLUMN] markers indicate multi-column layout
+- Page boundaries are marked with "--- Page N ---"
+- Block boundaries are preserved (empty lines between blocks)
+- Text is already in reading order
+- Personal information might be removed/redacted; do NOT reconstruct or guess it.
+
+JSON SCHEMA:
+{SCHEMA_TEXT}
+
+INSTRUCTIONS:
+- Extract all information from the document text above.
+- Use spatial hints ([HEADER_AREA], column markers) if present; if header is redacted, leave personal_info fields as "".
+- Map to the JSON schema structure exactly.
+- Use "YYYY-MM" format or "present" as defined in the system rules.
+- For required fields with missing data, use "" or [].
+- Apply COVERAGE POLICY and PROJECTS POLICY from system rules.
+- Ensure each project's tools_and_frameworks sums to 100.
+- Output ONLY valid JSON, no markdown, no explanations.

@@ -111,6 +111,7 @@ def extract_text_plain(structured: Dict) -> str:
 
     for page_idx, page in enumerate(pages):
         page_num = page.get("page_number", page_idx + 1)
+
         header = f"\n--- Page {page_num} ---\n"
 
         lines_acc: List[str] = []
@@ -130,9 +131,8 @@ def extract_text_plain(structured: Dict) -> str:
         page_text = "\n".join(lines_acc).strip()
         out_parts.append(header + page_text + "\n")
 
-    # ✅ Normalize ONCE at the end (so we can safely join across pages if needed)
+    # Normalize ONCE at the end (so we can safely join across pages if needed)
     full_text = "\n".join(out_parts).strip() + "\n"
-    full_text = normalize_cv_text(full_text)
 
     return full_text
 
@@ -232,9 +232,6 @@ def _pdf_to_structured_words(path: str, pdf_column_mode: str = "auto") -> Tuple[
 
         line_objs = _words_to_line_objects(words)
 
-        # ✅ Optional: reorder for 2-column pages
-        line_objs = _maybe_reorder_two_columns(line_objs, page.rect.width, mode=pdf_column_mode)
-
         blocks_out: List[Dict] = []
         page_text_parts: List[str] = []
         abs_pos = 0
@@ -270,69 +267,6 @@ def _pdf_to_structured_words(path: str, pdf_column_mode: str = "auto") -> Tuple[
         })
 
     return {"file_type": "pdf", "pages": pages_out}, diag
-
-
-def _maybe_reorder_two_columns(line_objs: List[Dict], page_width: float, mode: str = "auto") -> List[Dict]:
-    """
-    Reorder PDF lines for 2-column layouts using bbox x0 median split.
-    mode:
-      - "off": never reorder
-      - "on": always attempt reorder (even if weak signal)
-      - "auto": reorder only if 2-column signal is strong
-    """
-    if mode == "off":
-        return line_objs
-    if not line_objs or not page_width:
-        return line_objs
-
-    xs = []
-    for ln in line_objs:
-        bb = ln.get("bbox")
-        if bb and len(bb) == 4:
-            xs.append(float(bb[0]))
-    if len(xs) < 20:
-        return line_objs  # not enough lines to decide
-
-    x_med = median(xs)
-
-    left = []
-    right = []
-    for ln in line_objs:
-        bb = ln.get("bbox")
-        if not bb:
-            continue
-        x0, y0, x1, y1 = bb
-        if x0 <= x_med:
-            left.append(ln)
-        else:
-            right.append(ln)
-
-    # If one side is tiny, it's not really two columns
-    if len(left) < 8 or len(right) < 8:
-        return line_objs
-
-    # Compute separation strength
-    left_med = median([ln["bbox"][0] for ln in left])
-    right_med = median([ln["bbox"][0] for ln in right])
-    sep = right_med - left_med
-
-    # "auto" only: require a strong separation
-    if mode == "auto":
-        # must be a meaningful horizontal gap relative to page width
-        if sep < page_width * 0.25:
-            return line_objs
-
-        # also require left cluster really on left and right cluster really on right
-        if not (left_med < page_width * 0.45 and right_med > page_width * 0.45):
-            return line_objs
-
-    # Sort within columns by y0 then x0
-    left_sorted = sorted(left, key=lambda ln: (ln["bbox"][1], ln["bbox"][0]))
-    right_sorted = sorted(right, key=lambda ln: (ln["bbox"][1], ln["bbox"][0]))
-
-    # Read order: left column top-to-bottom, then right column top-to-bottom
-    # (simple + predictable; good enough for most CVs)
-    return left_sorted + right_sorted
 
 
 def _words_to_line_objects(

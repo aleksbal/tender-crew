@@ -11,8 +11,6 @@ from cv_text_extractor import extract_text_structured
 from llm_client import create_llm_client
 from converter import convert_input
 
-from cv_text_process import postprocess_cv_json
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -39,8 +37,8 @@ def main(argv=None):
     p.add_argument("--llm", action="store_true", help="Call local Ollama LLM to post-process structured output")
     p.add_argument("--llm-model", default="ollama/llama2", help="LLM model name for local Ollama")
     p.add_argument("--llm-kind", default="ollama", help="LLM provider kind (ollama|openai)")
-    p.add_argument("--system-prompt", default="cv_extraction_system_prompt_v4.txt", help="Path to system prompt file")
-    p.add_argument("--user-prompt", default="cv_extraction_user_prompt_v4.txt", help="Path to user prompt template file")
+    p.add_argument("--system-prompt", default="cv_extraction_system_prompt.txt", help="Path to system prompt file")
+    p.add_argument("--user-prompt", default="cv_extraction_user_prompt.txt", help="Path to user prompt template file")
     p.add_argument("--schema", default="schema.json", help="Path to JSON schema to present to LLM")
     args = p.parse_args(argv)
 
