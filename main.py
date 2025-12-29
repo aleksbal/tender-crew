@@ -11,6 +11,8 @@ from cv_text_extractor import extract_text_structured
 from llm_client import create_llm_client
 from converter import convert_input
 
+from cv_text_process import postprocess_cv_json
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -141,6 +143,9 @@ def main(argv=None):
                 out["pandoc_ast"] = pandoc_ast
 
         logger.info("Generating output...")
+
+        out = postprocess_cv_json(out)
+
         data = json.dumps(out, ensure_ascii=False, indent=2)
         if args.out:
             logger.info(f"Writing output to: {args.out}")

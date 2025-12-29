@@ -11,7 +11,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from jsonschema import validate as jsonschema_validate, ValidationError
+from jsonschema import ValidationError
 
 from cv_text_extractor import extract_text_plain
 
@@ -137,7 +137,7 @@ class LLMClient:
             except json.JSONDecodeError:
                 import re
                 # Try to extract JSON from response (may have extra text)
-                m = re.search(r"\{[\s\S]*\}", raw)
+                m = re.search(r"\{[\s\S]*}", raw)
                 if m:
                     try:
                         parsed = json.loads(m.group(0))

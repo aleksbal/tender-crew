@@ -3,13 +3,17 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 import fitz  # pymupdf
 from docx import Document
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 from docx.table import Table
+
+from cv_text_process import normalize_cv_text
+
+from statistics import median
 
 
 # =============================================================================
@@ -87,60 +91,49 @@ FOOTER_RE = re.compile(r"^\s*Lebenslauf\b.*\bSeite\s+\d+\s*$", re.IGNORECASE)
 # Public API
 # =============================================================================
 
-def extract_text_structured(path: str) -> Tuple[Dict, ExtractDiagnostics]:
-    """
-    Structured API: returns dict with pages->blocks.
-    IMPORTANT: For PDFs we do NOT use get_text('blocks') anymore.
-               We use WORDS->LINES to preserve reading order and prevent missing anchors.
-    """
+
+def extract_text_structured(path: str, pdf_column_mode: str = "auto") -> Tuple[Dict, ExtractDiagnostics]:
     ext = os.path.splitext(path.lower())[1]
     if ext == ".pdf":
-        return _pdf_to_structured_words(path)
+        return _pdf_to_structured_words(path, pdf_column_mode=pdf_column_mode)
     if ext == ".docx":
         return _docx_to_structured(path)
     raise ValueError(f"Unsupported file type: {ext}")
 
-
 def extract_text_plain(structured: Dict) -> str:
-    """
-    Chunker-friendly readable text:
-    - preserves page boundaries
-    - preserves block boundaries (blank line between blocks)
-    - DOES NOT invent [LEFT_COLUMN]/[RIGHT_COLUMN]/[HEADER_AREA]
-    - removes obvious footers (Lebenslauf … Seite N)
-    """
     pages = structured.get("pages", [])
     if not pages:
         return ""
 
-    parts: List[str] = []
+    is_pdf = structured.get("file_type") == "pdf"
+    out_parts: List[str] = []
+
     for page_idx, page in enumerate(pages):
         page_num = page.get("page_number", page_idx + 1)
-        parts.append(f"\n--- Page {page_num} ---\n")
+        header = f"\n--- Page {page_num} ---\n"
 
-        blocks = page.get("blocks", []) or []
-        for block in blocks:
-            block_text = (block.get("text") or "").strip()
-            if not block_text:
+        lines_acc: List[str] = []
+        for block in (page.get("blocks", []) or []):
+            t = (block.get("text") or "").strip()
+            if not t:
                 continue
-
-            # remove footer lines inside blocks
-            lines: List[str] = []
-            for ln in block_text.splitlines():
+            for ln in t.splitlines():
                 s = ln.strip()
-                if not s:
-                    continue
-                if FOOTER_RE.match(s):
-                    continue
-                lines.append(s)
+                if s and not FOOTER_RE.match(s):
+                    lines_acc.append(s)
 
-            if not lines:
-                continue
+            # preserve paragraph gaps only for docx
+            if not is_pdf:
+                lines_acc.append("")
 
-            parts.append("\n".join(lines))
-            parts.append("")  # blank line between blocks
+        page_text = "\n".join(lines_acc).strip()
+        out_parts.append(header + page_text + "\n")
 
-    return "\n".join(parts).strip() + "\n"
+    # ✅ Normalize ONCE at the end (so we can safely join across pages if needed)
+    full_text = "\n".join(out_parts).strip() + "\n"
+    full_text = normalize_cv_text(full_text)
+
+    return full_text
 
 
 # =============================================================================
@@ -220,12 +213,7 @@ def _normalize_block(block: str) -> List[str]:
 # PDF (FIXED): WORDS -> LINES (for both readable and structured)
 # =============================================================================
 
-def _pdf_to_structured_words(path: str) -> Tuple[Dict, ExtractDiagnostics]:
-    """
-    Structured PDF extraction (WORDS->LINES):
-    Produces blocks that are essentially reconstructed lines (or small line groups),
-    with bboxes. This preserves the anchor dates far better than get_text("blocks").
-    """
+def _pdf_to_structured_words(path: str, pdf_column_mode: str = "auto") -> Tuple[Dict, ExtractDiagnostics]:
     doc = fitz.open(path)
     diag = ExtractDiagnostics(file_type="pdf", pages=doc.page_count)
     pages_out: List[Dict] = []
@@ -243,33 +231,31 @@ def _pdf_to_structured_words(path: str) -> Tuple[Dict, ExtractDiagnostics]:
 
         line_objs = _words_to_line_objects(words)
 
+        # ✅ Optional: reorder for 2-column pages
+        line_objs = _maybe_reorder_two_columns(line_objs, page.rect.width, mode=pdf_column_mode)
+
         blocks_out: List[Dict] = []
         page_text_parts: List[str] = []
         abs_pos = 0
 
         for ln in line_objs:
-            text = ln["text"].strip()
+            text = (ln.get("text") or "").strip()
             if not text:
                 continue
-
-            # optional footer kill right here (helps both structured & readable)
             if FOOTER_RE.match(text):
                 continue
 
-            # In structured view, each reconstructed line is a block
             block_text = text
-            # char spans inside page_text (simple: whole line)
             char_start = abs_pos
             char_end = char_start + len(block_text)
 
             blocks_out.append({
-                "bbox": ln["bbox"],
+                "bbox": ln.get("bbox"),
                 "text": block_text,
                 "lines": [{"text": block_text, "char_start": char_start, "char_end": char_end}],
             })
 
             page_text_parts.append(block_text)
-            # account for separator "\n\n" between blocks
             abs_pos = char_end + 2
 
         page_text = "\n\n".join(page_text_parts)
@@ -283,6 +269,71 @@ def _pdf_to_structured_words(path: str) -> Tuple[Dict, ExtractDiagnostics]:
         })
 
     return {"file_type": "pdf", "pages": pages_out}, diag
+
+
+def _maybe_reorder_two_columns(line_objs: List[Dict], page_width: float, mode: str = "auto") -> List[Dict]:
+    """
+    Reorder PDF lines for 2-column layouts using bbox x0 median split.
+    mode:
+      - "off": never reorder
+      - "on": always attempt reorder (even if weak signal)
+      - "auto": reorder only if 2-column signal is strong
+    """
+    if mode == "off":
+        return line_objs
+    if not line_objs or not page_width:
+        return line_objs
+
+    xs = []
+    for ln in line_objs:
+        bb = ln.get("bbox")
+        if bb and len(bb) == 4:
+            xs.append(float(bb[0]))
+    if len(xs) < 20:
+        return line_objs  # not enough lines to decide
+
+    x_med = median(xs)
+
+    left = []
+    right = []
+    for ln in line_objs:
+        bb = ln.get("bbox")
+        if not bb:
+            continue
+        x0, y0, x1, y1 = bb
+        if x0 <= x_med:
+            left.append(ln)
+        else:
+            right.append(ln)
+
+    # If one side is tiny, it's not really two columns
+    if len(left) < 8 or len(right) < 8:
+        return line_objs
+
+    # Compute separation strength
+    left_med = median([ln["bbox"][0] for ln in left])
+    right_med = median([ln["bbox"][0] for ln in right])
+    sep = right_med - left_med
+
+    # "auto" only: require a strong separation
+    if mode == "auto":
+        # must be a meaningful horizontal gap relative to page width
+        if sep < page_width * 0.25:
+            return line_objs
+
+        # also require left cluster really on left and right cluster really on right
+        if not (left_med < page_width * 0.45 and right_med > page_width * 0.45):
+            return line_objs
+
+    # Sort within columns by y0 then x0
+    left_sorted = sorted(left, key=lambda ln: (ln["bbox"][1], ln["bbox"][0]))
+    right_sorted = sorted(right, key=lambda ln: (ln["bbox"][1], ln["bbox"][0]))
+
+    # Read order: left column top-to-bottom, then right column top-to-bottom
+    # (simple + predictable; good enough for most CVs)
+    return left_sorted + right_sorted
+
+
 
 def _words_to_line_objects(words) -> List[Dict]:
     """
