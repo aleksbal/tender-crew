@@ -22,7 +22,7 @@ except Exception:
 
 
 class LLMClient:
-    def __init__(self, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None, schema_path: str | Path | None = None, model: str = "ollama/llama2", max_length: int = 8192, max_retries: int = 3):
+    def __init__(self, system_prompt_path: str | Path | None = None, user_prompt_path: str | Path | None = None, schema_path: str | Path | None = None, model: str = "llama3.1", max_length: int = 8192, max_retries: int = 3):
         """
         Initialize LLM client with system prompt, user prompt templates, as well as JSON schema path.
         Both are loaded once at construction time since they never change.

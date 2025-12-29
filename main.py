@@ -7,6 +7,7 @@ import subprocess
 from typing import Optional
 from pathlib import Path
 
+from cv_text_scrubber_de import CvAnonymizer, AnonymizeConfig
 from llm_client import create_llm_client
 from mymupdf_extractor import extract_plain_text
 
@@ -56,8 +57,12 @@ def main(argv=None):
         # Apply redaction only if --redact flag is set
         if args.redact:
             logger.info("Redacting PII using header-based approach...")
+            anon = CvAnonymizer(AnonymizeConfig(debug=True, url_policy="keep_domain"))
+            text_for_json = anon.anonymize(text_for_json, preferred_language="de")
         else:
             logger.info("PII redaction skipped (use --redact to enable)")
+
+        logger.info(text_for_json)
 
         llm_response = None
         if args.llm:
@@ -105,19 +110,42 @@ def main(argv=None):
 
         # If LLM was used, the LLM response is the primary output (converted CV JSON)
         # Otherwise, output the raw extracted structured data
+        # If LLM was used, the LLM response is the primary output (converted CV JSON)
+        # Otherwise, output the raw extracted structured data
         if llm_response is not None:
             try:
                 # LLM response is the converted CV JSON - this is what we want as output
                 llm_json = json.loads(llm_response)
                 out = llm_json
                 logger.info("Using LLM-generated JSON as primary output")
-                logger.info(out)
             except json.JSONDecodeError:
                 # If LLM failed, fall back to raw data and include error
                 logger.warning("LLM response is not valid JSON, using raw extracted data")
+                out = {
+                    "structured": "",
+                    "diagnostics": "",
+                    "llm_error": llm_response,
+                }
         else:
-            logger.info("LLM responds with no valid JSON")
+            # No LLM processing - output raw extracted data
+            out = {
+                "structured": "",
+                "diagnostics": "",
+            }
 
+        logger.info("Generating output...")
+
+        data = json.dumps(out, ensure_ascii=False, indent=2)
+        if args.out:
+            logger.info(f"Writing output to: {args.out}")
+            with open(args.out, "w", encoding="utf-8") as fh:
+                fh.write(data)
+        else:
+            print(data)
+
+        if llm_response is not None:
+            print('\n---- LLM response (also in output file) ----')
+            print(llm_response)
 
     finally:
         # cleanup tmp files
