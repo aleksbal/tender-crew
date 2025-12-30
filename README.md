@@ -11,7 +11,9 @@ Usage
 pip install pymupdf python-docx
 ```
 
-2. Quick smoke test with a DOCX
+Quick smoke test with a DOCX
+
+Install Ollama locally and connect with Ollama Cloud account
 
 Create a minimal sample CV:
 
@@ -35,12 +37,71 @@ d.save("sample_cv.docx")
 PY
 ```
 
-Run extraction + redaction (writes JSON to stdout or use `-o`):
+Run JSON extraction (writes JSON to stdout or use `-o`):
 
 ```bash
 python3 cv_llm_converter.py sample_cv.docx --llm --llm-kind ollama --llm-model gpt-oss:120b-cloud -o sample_out.json
 # Pretty-print result
 python3 -m json.tool sample_out.json | less
+```
+
+Result:
+
+```json
+{
+  "personal_info": {
+    "first_name": "Max",
+    "last_name": "Mustermann",
+    "address": "Musterstraße 1, 12345 Musterstadt",
+    "phone": "+49 123 4567890",
+    "email": "max@example.com",
+    "linkedin": "",
+    "website": ""
+  },
+  "summary": "",
+  "experience": [
+    {
+      "start_date": "2022-01",
+      "end_date": "2023-02",
+      "is_current": false,
+      "company": "Company A",
+      "role": "Developer",
+      "location": "",
+      "employment_type": "",
+      "description": "- Working on a project with Java, MySQL and Gradle",
+      "technologies": [
+        "Java",
+        "MySQL",
+        "Gradle"
+      ],
+      "evidence": "01/2022 02/2023 | - Company A, Developer"
+    },
+    {
+      "start_date": "2023-03",
+      "end_date": "2025-12",
+      "is_current": false,
+      "company": "Company B",
+      "role": "Developer",
+      "location": "",
+      "employment_type": "",
+      "description": "- Working on a project with Python and PostgreSQL",
+      "technologies": [
+        "Python",
+        "PostgreSQL"
+      ],
+      "evidence": "03/2023 12/2025 | - Company B, Developer"
+    }
+  ],
+  "education": [],
+  "skills": {
+    "programming_languages": [],
+    "technologies": [],
+    "soft_skills": []
+  },
+  "projects": [],
+  "certifications": [],
+  "languages": []
+}
 ```
 
 Notes
