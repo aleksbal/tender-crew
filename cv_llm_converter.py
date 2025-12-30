@@ -33,6 +33,7 @@ def main(argv=None):
     p.add_argument("path", help="Path to input file (PDF or DOCX)")
     p.add_argument("-o", "--out", help="Output JSON file (default stdout)")
     p.add_argument("--redact", action="store_true", help="Enable PII redaction (default: disabled)")
+    p.add_argument("--pii-limit", type=int, metavar="N", help="Limit PII obfuscation to first N characters (0 = whole text, omit = no obfuscation)")
     p.add_argument("--llm-model", default="ollama/llama2", help="LLM model name for local Ollama")
     p.add_argument("--llm-kind", default="ollama", help="LLM provider kind (ollama|openai)")
     p.add_argument("--system-prompt", default="cv_extraction_system_prompt.txt", help="Path to system prompt file")
@@ -52,13 +53,29 @@ def main(argv=None):
 
         text_for_json = extract_plain_text(src)
 
-        # Apply redaction only if --redact flag is set
-        if args.redact:
-            logger.info("Redacting PII using header-based approach...")
-            anon = CvAnonymizer(AnonymizeConfig(debug=True, url_policy="keep_domain"))
+        # Apply redaction based on --pii-limit parameter
+        # If --pii-limit is not provided: no obfuscation
+        # If --pii-limit is provided with value 0: obfuscate whole text
+        # If --pii-limit is provided with value N: obfuscate first N characters
+        if args.pii_limit is not None:
+            pii_limit = args.pii_limit if args.pii_limit > 0 else 0
+            if pii_limit == 0:
+                logger.info("Redacting PII from entire text...")
+            else:
+                logger.info(f"Redacting PII from first {pii_limit} characters...")
+            anon = CvAnonymizer(AnonymizeConfig(
+                debug=True,
+                url_policy="keep_domain",
+                pii_obfuscation_limit=pii_limit
+            ))
+            text_for_json = anon.anonymize(text_for_json, preferred_language="de")
+        elif args.redact:
+            # Legacy --redact flag: obfuscate whole text
+            logger.info("Redacting PII from entire text (legacy --redact flag)...")
+            anon = CvAnonymizer(AnonymizeConfig(debug=True, url_policy="keep_domain", pii_obfuscation_limit=0))
             text_for_json = anon.anonymize(text_for_json, preferred_language="de")
         else:
-            logger.info("PII redaction skipped (use --redact to enable)")
+            logger.info("PII redaction skipped (use --pii-limit to enable)")
 
         logger.info(text_for_json)
 

@@ -1,24 +1,26 @@
 """
 cv_pii_scrubber.py
 
-Production-grade CV text anonymizer (DE/EN) using a hybrid approach.
+IT CV text anonymizer (DE/EN) using a hybrid approach.
 
 Pipeline (deterministic, auditable):
   1) Normalize text for stable matching (apostrophes, hyphens, NBSP)
   2) Presidio Analyzer (spaCy NER) + custom regex recognizers for high-precision PII
-  3) Validate/filter risky PHONE_NUMBER detections (avoid eating dates/years)
-  4) First anonymization pass with Presidio spans
-  5) PrimaryIdentityResolver selects candidate's primary name (candidate extraction + scoring)
-  6) Propagate masking for chosen name variants + initials
-  7) URL policy pass (avoid leaking personal websites / repeated footer URLs)
-  8) Postprocess pass (collapse repeated tags, punctuation spacing, blank lines)
-  9) Optional debug output: chosen identity, scoring breakdown, masked variants/patterns
+  3) First anonymization pass with Presidio spans
+  4) PrimaryIdentityResolver selects candidate's primary name using:
+     - NameCandidateExtractor: extracts from Presidio, headers, emails, LinkedIn
+     - NameScorer: scores candidates with configurable weights (replaces magic numbers)
+     - NameVariantGenerator: generates variants (handles middle names, hyphenated names, reversed order)
+  5) Propagate masking for chosen name variants + initials
+  6) Combined URL policy + postprocessing pass (single traversal for efficiency)
+  7) Optional debug output: chosen identity, scoring breakdown, masked variants/patterns
 
-Why phone filtering exists:
-  CVs contain many date ranges (e.g. "2/1997 - 12/1998", "2003-2004") that sloppy phone patterns
-  can misclassify as PHONE_NUMBER. We therefore drop PHONE_NUMBER results unless:
-    - the matched span has >= min_phone_digits digits (configurable), AND
-    - the matched span is not "date-like" by a set of heuristics.
+Architecture improvements:
+  - Phone detection: stricter regex pattern excludes date formats (no post-filtering needed)
+  - PatternRegistry: centralized regex patterns for easier maintenance
+  - AddressFilter: consolidated address detection logic
+  - Modular identity resolution: separate extractor, scorer, and variant generator classes
+  - Reduced passes: URL policy and postprocessing combined into single pass
 
 Dependencies:
   pip install presidio-analyzer presidio-anonymizer spacy
@@ -58,7 +60,6 @@ class AnonymizeConfig:
         "PHONE_NUMBER",
         "LINKEDIN_PROFILE",
         "URL",
-        "LOCATION",
     )
 
     run_both_lang_passes: bool = True
@@ -69,9 +70,6 @@ class AnonymizeConfig:
     min_name_token_len: int = 3
     min_lastname_len_for_initials: int = 3
 
-    # Phone validation (prevents dates/years being masked as phones)
-    min_phone_digits: int = 8
-    drop_phone_if_date_like: bool = True
 
     # URL policy:
     # "redact_all" | "keep_domain" | "allowlist_domains_keep_domain"
@@ -79,6 +77,9 @@ class AnonymizeConfig:
     url_domain_allowlist: Tuple[str, ...] = ("linkedin.com", "www.linkedin.com")
 
     debug: bool = False
+
+    # Limit PII obfuscation to first N characters (0 = no limit, process entire text)
+    pii_obfuscation_limit: int = 0
 
     # Override Presidio anonymizer operators if you want custom tokens
     operators: Optional[dict] = None
@@ -118,57 +119,309 @@ def _strip_name_token(token: str) -> str:
     return re.sub(r"[^\wÄÖÜäöüß\-']", "", token)
 
 
-def _contains_address_markers(s: str) -> bool:
-    return bool(re.search(r"(straße|strasse|str\.)\b", s, flags=re.IGNORECASE)) or bool(re.search(r"\b\d{5}\b", s))
-
-
 # -----------------------------
-# PHONE filtering (avoid date false positives)
+# Pattern Registry
 # -----------------------------
 
-_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
-_MONTH_YEAR_RE = re.compile(r"\b\d{1,2}[\/.](?:19|20)\d{2}\b")          # 2/1997 or 12.1998
-_YEAR_MONTH_RE = re.compile(r"\b(?:19|20)\d{2}[\/.]\d{1,2}\b")          # 1997/12 or 1998.2
-_MONTHYEAR_RANGE_RE = re.compile(
-    r"\b\d{1,2}[\/.](?:19|20)\d{2}\s*[-–]\s*\d{1,2}[\/.](?:19|20)\d{2}\b"
-)  # 2/1997 - 12/1998
-
-
-def _digits_only(s: str) -> str:
-    return re.sub(r"\D", "", s)
-
-
-def _is_date_like_phone_span(span_text: str) -> bool:
+class PatternRegistry:
     """
-    Heuristics: reject spans that look like dates / date ranges.
-
-    Note:
-      This is intentionally conservative: it prefers *not masking* over masking a year range.
-      It is applied ONLY to PHONE_NUMBER spans.
+    Centralized registry for all regex patterns used in PII detection.
+    Makes patterns easier to maintain, test, and tune.
     """
-    s = span_text.strip()
-
-    # Classic CV patterns
-    if _MONTHYEAR_RANGE_RE.search(s):
-        return True
-
-    # Explicit month/year or year/month tokens
-    if _MONTH_YEAR_RE.search(s) or _YEAR_MONTH_RE.search(s):
-        return True
-
-    # If the span includes a year token at all, assume "date-ish" in CV context.
-    # This prevents things like "2/1997" being partially masked.
-    if _YEAR_RE.search(s):
-        return True
-
-    return False
+    
+    # Email patterns
+    EMAIL_STANDARD = r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\b"
+    EMAIL_OBFUSCATED = r"\b[a-zA-Z0-9_.+-]+\s*(?:\(|\[)?\s*(?:at|@)\s*(?:\)|\])?\s*[a-zA-Z0-9-]+\s*(?:\(|\[)?\s*(?:dot|\.)\s*(?:\)|\])?\s*[a-zA-Z0-9-.]+\b"
+    
+    # Phone pattern: stricter to avoid matching dates
+    # Note: We use a simpler pattern and validate in post-processing to exclude dates
+    PHONE_STRICT = (
+        r"\b(?:\+?\d{1,4}[\s().-]?)?(?:\(?\d{2,5}\)?[\s().-]?)?\d{2,4}[\s().-]?\d{2,4}[\s().-]?\d{2,6}\b"
+    )
+    
+    # Date patterns to exclude from phone detection
+    DATE_MONTH_YEAR = re.compile(r"\b\d{1,2}[/.]\s*(?:19|20)\d{2}\b")  # 2/2025, 12.1998
+    DATE_YEAR_MONTH = re.compile(r"\b(?:19|20)\d{2}[/.]\s*\d{1,2}\b")  # 2025/2, 1998.12
+    DATE_YEAR_RANGE = re.compile(r"\b(?:19|20)\d{2}\s*[-–]\s*(?:19|20)\d{2}\b")  # 2025-2026
+    DATE_MONTHYEAR_RANGE = re.compile(r"\b\d{1,2}[/.](?:19|20)\d{2}\s*[-–]\s*\d{1,2}[/.](?:19|20)\d{2}\b")  # 2/2025 - 12/2025
+    
+    # German address patterns
+    STREET_TYPES = r"(?:straße|strasse|str\.|weg|allee|gasse|platz|ring|damm|ufer)"
+    ADDRESS_FULL_DE = rf"\b[A-ZÄÖÜ][\wÄÖÜäöüß\.\- ]{{2,}}?{STREET_TYPES}\s+\d{{1,4}}[a-zA-Z]?\s*,?\s*\d{{5}}\s+[A-ZÄÖÜ][\wÄÖÜäöüß\.\- ]{{1,}}\b"
+    ADDRESS_ZIP_CITY_DE = r"\b\d{5}\s+[A-ZÄÖÜ][\wÄÖÜäöüß\- ]{2,}\b"
+    
+    # LinkedIn patterns
+    LINKEDIN_PROFILE = r"\b(?:https?://)?(?:[a-z]{2,3}\.)?linkedin\.com/(?:in|pub)/[A-Za-z0-9\-_%/]+/?\b"
+    LINKEDIN_HANDLE_EXTRACT = r"linkedin\.com/(?:in|pub)/([^/?#\s]+)"
+    
+    # URL patterns
+    URL_SCHEME = r"\bhttps?://[^\s<>()\[\]\"']{6,}\b"
+    URL_BARE = r"\b(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:/[^\s<>()\[\]\"']*)?\b"
+    URL_FIND = rf"{URL_SCHEME}|{URL_BARE}"
+    
+    # Name patterns
+    TITLE_CASE_WORD = r"^[A-ZÄÖÜ][a-zäöüß]+(?:[-'][A-ZÄÖÜa-zäöüß]+)?$"
+    TITLE_CASE_COMPOUND = r"^[A-ZÄÖÜ][a-zäöüß]+(?:[-'][A-ZÄÖÜa-zäöüß]+)+$"
+    
+    # Contact zone detection
+    CONTACT_ZONE = r"\b(contact|kontakt|address|adresse|email|e-mail|phone|telefon)\b"
 
 
 # -----------------------------
-# Primary Identity Resolver
+# Address Filter
 # -----------------------------
 
-class PrimaryIdentityResolver:
+class AddressFilter:
+    """
+    Centralized address detection logic to avoid scattered checks.
+    """
+    _STREET_PATTERN = re.compile(r"(straße|strasse|str\.)\b", flags=re.IGNORECASE)
+    _ZIP_CODE_PATTERN = re.compile(r"\b\d{5}\b")
+    
+    @classmethod
+    def contains_markers(cls, text: str) -> bool:
+        """
+        Check if text contains address markers (street names or German zip codes).
+        """
+        return bool(cls._STREET_PATTERN.search(text)) or bool(cls._ZIP_CODE_PATTERN.search(text))
+    
+    @classmethod
+    def should_exclude(cls, text: str) -> bool:
+        """
+        Determine if text should be excluded because it looks like an address.
+        """
+        return cls.contains_markers(text)
+
+
+# -----------------------------
+# City Name Filter
+# -----------------------------
+
+class CityNameFilter:
+    """
+    Filters out city names that are misclassified as PERSON entities.
+    """
+    # Common German and international cities
+    CITY_NAMES = {
+        # German cities
+        "mainz", "hamburg", "berlin", "münchen", "munich", "köln", "cologne",
+        "frankfurt", "stuttgart", "düsseldorf", "dortmund", "essen", "leipzig",
+        "bremen", "dresden", "hannover", "nürnberg", "nuremberg", "duisburg",
+        "bochum", "wuppertal", "bielefeld", "bonn", "münster", "karlsruhe",
+        "mannheim", "augsburg", "wiesbaden", "gelsenkirchen", "mönchengladbach",
+        "braunschweig", "chemnitz", "kiel", "aachen", "halle", "magdeburg",
+        "freiburg", "krefeld", "lübeck", "oberhausen", "erfurt", "mainz",
+        "rostock", "kassel", "hagen", "hamm", "saarbrücken", "mülheim",
+        "potsdam", "ludwigshafen", "oldenburg", "leverkusen", "osnabrück",
+        "solingen", "heidelberg", "herne", "neuss", "darmstadt", "paderborn",
+        "regensburg", "ingolstadt", "würzburg", "fürth", "wolfsburg", "offenbach",
+        "ulm", "heilbronn", "pforzheim", "göttingen", "bottrop", "trier",
+        "recklinghausen", "reutlingen", "bremerhaven", "koblenz", "bergisch",
+        "jena", "remscheid", "erlangen", "moers", "siegen", "hildesheim",
+        "salzgitter", "cottbus", "gütersloh", "kaiserslautern", "schwerin",
+        "witten", "gera", "isenburg", "zwickau", "düren", "ratingen",
+        
+        # International cities (common in CVs)
+        "london", "paris", "madrid", "rome", "amsterdam", "brussels", "vienna",
+        "zurich", "stockholm", "copenhagen", "oslo", "helsinki", "warsaw",
+        "prague", "budapest", "bucharest", "sofia", "athens", "lisbon",
+        "dublin", "edinburgh", "glasgow", "birmingham", "manchester", "liverpool",
+        "barcelona", "milan", "naples", "turin", "genoa", "florence", "venice",
+        "rotterdam", "the hague", "utrecht", "eindhoven", "groningen",
+        "brussels", "antwerp", "ghent", "bruges", "lyon", "marseille", "toulouse",
+        "nice", "nantes", "strasbourg", "bordeaux", "lille", "rennes",
+        "vienna", "salzburg", "graz", "linz", "innsbruck", "zurich", "geneva",
+        "basel", "bern", "lausanne", "stockholm", "gothenburg", "malmo",
+        "copenhagen", "aarhus", "odense", "oslo", "bergen", "trondheim",
+        "helsinki", "tampere", "turku", "warsaw", "krakow", "gdansk", "wroclaw",
+        "prague", "brno", "ostrava", "budapest", "debrecen", "szeged",
+        "bucharest", "cluj", "timisoara", "sofia", "plovdiv", "varna",
+        "athens", "thessaloniki", "patras", "lisbon", "porto", "coimbra",
+        "dublin", "cork", "galway", "limerick",
+        
+        # US cities (common in tech CVs)
+        "new york", "los angeles", "chicago", "houston", "phoenix", "philadelphia",
+        "san antonio", "san diego", "dallas", "san jose", "austin", "jacksonville",
+        "san francisco", "indianapolis", "columbus", "fort worth", "charlotte",
+        "seattle", "denver", "washington", "boston", "el paso", "detroit",
+        "nashville", "portland", "oklahoma city", "las vegas", "memphis",
+        "louisville", "baltimore", "milwaukee", "albuquerque", "tucson",
+        "fresno", "sacramento", "kansas city", "mesa", "atlanta", "omaha",
+        "colorado springs", "raleigh", "miami", "long beach", "virginia beach",
+        "oakland", "minneapolis", "tulsa", "tampa", "cleveland", "wichita",
+        "arlington", "new orleans", "honolulu",
+    }
+    
+    @classmethod
+    def is_city_name(cls, text: str) -> bool:
+        """
+        Check if text is a known city name.
+        """
+        text_lower = _safe_lower(text.strip())
+        # Check exact match
+        if text_lower in cls.CITY_NAMES:
+            return True
+        # Check if text contains a city name (for compound names like "New York")
+        words = re.split(r"[\s\-_]+", text_lower)
+        return any(word in cls.CITY_NAMES for word in words)
+    
+    @classmethod
+    def should_exclude(cls, text: str) -> bool:
+        """
+        Determine if text should be excluded because it's a city name.
+        """
+        return cls.is_city_name(text)
+
+
+# -----------------------------
+# Technology Filter
+# -----------------------------
+
+class TechnologyFilter:
+    """
+    Filters out technology/product names and common false positives from PERSON entities.
+    """
+    # Common technology/product names that are often misclassified as PERSON or LOCATION
+    TECHNOLOGY_NAMES = {
+        # Programming languages
+        "java", "python", "javascript", "typescript", "node", "react", "angular", "vue",
+        "c", "c++", "c#", "go", "rust", "ruby", "php", "swift", "kotlin", "scala",
+        "groovy", "perl", "r", "matlab", "sql", "html", "css", "scss", "sass",
+        
+        # Databases
+        "oracle", "mysql", "postgresql", "mongodb", "redis", "kafka", "elasticsearch",
+        "cassandra", "dynamodb", "couchdb", "neo4j", "influxdb", "timescaledb",
+        "db2", "sqlite", "mariadb",
+        
+        # Build tools & package managers
+        "maven", "gradle", "npm", "yarn", "pip", "composer", "poetry", "cargo",
+        "ant", "make", "cmake", "bazel", "buck", "pants",
+        
+        # CI/CD & DevOps
+        "jenkins", "gitlab", "github", "bitbucket", "bamboo", "teamcity", "circleci",
+        "travis", "azure devops", "azure pipelines", "argocd", "spinnaker",
+        "git", "svn", "mercurial", "perforce",
+        
+        # Containers & Orchestration
+        "docker", "kubernetes", "helm", "kustomize", "rancher", "openshift",
+        "docker compose", "podman", "containerd",
+        
+        # Cloud platforms
+        "aws", "azure", "gcp", "google cloud", "alibaba cloud", "oracle cloud",
+        "digitalocean", "linode", "vultr", "heroku", "vercel", "netlify",
+        
+        # Infrastructure as Code
+        "terraform", "ansible", "puppet", "chef", "saltstack", "cloudformation",
+        "pulumi", "cdk", "serverless",
+        
+        # Monitoring & Observability
+        "prometheus", "grafana", "opentelemetry", "new relic", "datadog", "splunk",
+        "elastic", "elk", "kibana", "logstash", "graylog", "zabbix", "nagios",
+        "instana", "dynatrace", "appdynamics", "sentry", "rollbar",
+        
+        # Security & Auth
+        "keycloak", "oauth", "oauth2", "saml", "ldap", "vault", "consul",
+        "cert-manager", "istio", "linkerd",
+        
+        # API tools
+        "swagger", "openapi", "postman", "insomnia", "graphql", "rest", "soap",
+        "grpc", "protobuf", "protocol buffers",
+        
+        # Testing frameworks
+        "junit", "testcontainers", "jest", "jasmine", "karma", "mocha", "cypress",
+        "selenium", "playwright", "pytest", "rspec", "testng", "spock",
+        "wiremock", "mockito", "sinon", "nock",
+        
+        # Linting & Formatting
+        "eslint", "prettier", "stylelint", "husky", "lint-staged", "black",
+        "flake8", "pylint", "mypy", "rubocop", "gofmt", "clang-format",
+        
+        # Build tools & bundlers
+        "webpack", "rollup", "vite", "parcel", "browserify", "gulp", "grunt",
+        "lombok", "mapstruct", "querydsl",
+        
+        # Frameworks & Libraries
+        "spring", "spring boot", "spring cloud", "spring cloud stream", "cloud stream",
+        "django", "flask", "fastapi", "express", "rails", "laravel", "symfony",
+        "dropwizard", "micronaut", "quarkus", "vertx", "akka",
+        "hibernate", "jpa", "liquibase", "flyway", "alembic",
+        "rxjs", "lodash", "underscore", "jquery", "bootstrap", "tailwind",
+        "thymeleaf", "jsp", "jsf", "vaadin",
+        
+        # AI/ML
+        "crew ai", "crew", "openai", "anthropic", "langchain", "llama",
+        "tensorflow", "pytorch", "keras", "scikit-learn", "pandas", "numpy",
+        
+        # Operating systems
+        "linux", "windows", "macos", "ubuntu", "debian", "centos", "redhat",
+        "fedora", "suse", "arch", "alpine", "freebsd", "openbsd",
+        
+        # Web servers
+        "apache", "nginx", "tomcat", "jetty", "wildfly", "jboss", "glassfish",
+        "iis", "caddy", "traefik",
+        
+        # Message queues
+        "kafka", "rabbitmq", "activemq", "artemis", "pulsar", "nats", "zeromq",
+        
+        # Version control & collaboration
+        "jira", "confluence", "slack", "teams", "zoom", "mattermost", "discord",
+        "trello", "asana", "notion",
+        
+        # Enterprise software
+        "salesforce", "sap", "workday", "servicenow", "oracle ebs", "peoplesoft",
+        
+        # Other tools
+        "sonarqube", "codeclimate", "coveralls", "codacy", "intellij idea",
+        "eclipse", "vscode", "vim", "emacs", "sublime",
+        "gnu make", "piral", "qemu", "kvm", "proxmox", "openvz", "openstack",
+        "xen", "esx", "vmware", "virtualbox", "vagrant",
+    }
+    
+    # Common false positives (non-name words that appear in CVs)
+    FALSE_POSITIVES = {
+        "office", "mobile", "phone", "email", "address", "contact",
+        "project", "projects", "experience", "skills", "education",
+        "summary", "objective", "profile", "curriculum", "vitae",
+        "lebenslauf", "resume", "cv",
+    }
+    
+    @classmethod
+    def _get_exclude_set(cls) -> Set[str]:
+        """Get combined exclude set (lazy initialization)."""
+        return cls.TECHNOLOGY_NAMES | cls.FALSE_POSITIVES
+    
+    @classmethod
+    def is_technology_name(cls, text: str) -> bool:
+        """
+        Check if text is a known technology/product name.
+        """
+        text_lower = _safe_lower(text.strip())
+        exclude_set = cls._get_exclude_set()
+        # Check exact match
+        if text_lower in exclude_set:
+            return True
+        # Check if any word in the text is a tech name
+        words = re.split(r"[\s\-_]+", text_lower)
+        return any(word in exclude_set for word in words)
+    
+    @classmethod
+    def should_exclude(cls, text: str) -> bool:
+        """
+        Determine if text should be excluded because it's a technology name or false positive.
+        """
+        return cls.is_technology_name(text)
+
+
+
+
+# -----------------------------
+# Name Candidate Extractor
+# -----------------------------
+
+class NameCandidateExtractor:
+    """
+    Extracts name candidates from various sources (Presidio, headers, emails, LinkedIn).
+    """
     _STOPWORDS = {
         "curriculum", "vitae", "lebenslauf", "profil", "profile", "summary",
         "kontakt", "contact", "information", "info", "adresse", "address",
@@ -179,66 +432,100 @@ class PrimaryIdentityResolver:
         "gmbh", "ag", "inc", "ltd", "llc", "company", "university", "universität",
         "prof", "prof.", "dr", "dr.", "mr", "mrs", "ms",
     }
+    _TITLE_CASE_WORD = re.compile(PatternRegistry.TITLE_CASE_WORD)
 
-    _TITLE_CASE_WORD = re.compile(r"^[A-ZÄÖÜ][a-zäöüß]+(?:[-'][A-ZÄÖÜa-zäöüß]+)?$")
-
-    def __init__(self, config: AnonymizeConfig):
-        self.config = config
-
-    def resolve(
+    def extract_all(
         self,
         text: str,
         presidio_results: Sequence[RecognizerResult],
         extracted_urls: Sequence[str],
         extracted_emails: Sequence[str],
-    ) -> Dict:
+    ) -> List[Dict]:
+        """Extract candidates from all sources."""
         text_norm = normalize_text_for_matching(text)
         lines = text_norm.splitlines()
-
         address_spans = [(r.start, r.end) for r in presidio_results if r.entity_type == "ADDRESS"]
 
         candidates: List[Dict] = []
-        candidates += self._candidates_from_person_spans(text_norm, presidio_results, address_spans)
-        candidates += self._candidates_from_header_lines(lines)
-        candidates += self._candidates_from_emails(extracted_emails)
-        candidates += self._candidates_from_linkedin(extracted_urls)
+        candidates += self.from_person_spans(text_norm, presidio_results, address_spans)
+        candidates += self.from_header_lines(lines)
+        candidates += self.from_emails(extracted_emails)
+        candidates += self.from_linkedin(extracted_urls)
+        
+        # Apply context-aware filtering (tech stack contexts)
+        candidates = self._filter_tech_stack_context(candidates, text_norm)
+        
+        return candidates
+    
+    def _filter_tech_stack_context(self, candidates: List[Dict], text: str) -> List[Dict]:
+        """
+        Filter out candidates that appear in tech stack contexts (comma-separated lists, "used tech:" etc.)
+        """
+        filtered: List[Dict] = []
+        text_lower = text.lower()
+        
+        for cand in candidates:
+            name = cand.get("name", "")
+            name_lower = _safe_lower(name)
+            
+            # Check if this appears in a tech stack context
+            # Look for patterns like "used tech:", "technologies:", "tech stack:", etc.
+            # Include German patterns: "Eingesetzte Technologien:", "Technologien:", etc.
+            tech_context_patterns = [
+                r"used\s+tech[:\s]",
+                r"technologies[:\s]",
+                r"tech\s+stack[:\s]",
+                r"skills[:\s]",
+                r"tools[:\s]",
+                r"eingesetzte\s+technologien[:\s]",  # German: "Used technologies"
+                r"technologien[:\s]",  # German: "Technologies"
+                r"verwendete\s+technologien[:\s]",  # German: "Technologies used"
+                r"technologien\s+und\s+tools[:\s]",  # German: "Technologies and tools"
+                r"verwendete\s+technik[:\s]",  # German: "Technology used"
+                r"werkzeuge[:\s]",  # German: "Tools"
+                r"software[:\s]",  # German: "Software"
+                r"frameworks[:\s]",  # German/English: "Frameworks"
+                r"bibliotheken[:\s]",  # German: "Libraries"
+            ]
+            
+            # Find all occurrences of this name in the text
+            name_pattern = re.escape(name)
+            matches = list(re.finditer(rf"\b{name_pattern}\b", text, flags=re.IGNORECASE))
+            
+            # Check if any match is in a tech context
+            in_tech_context = False
+            for match in matches:
+                start = match.start()
+                # Look backwards for tech context indicators
+                context_start = max(0, start - 100)
+                context = text[context_start:start + len(name) + 50].lower()
+                
+                for pattern in tech_context_patterns:
+                    if re.search(pattern, context):
+                        in_tech_context = True
+                        break
+                
+                # Also check if it's in a comma-separated list (likely tech stack)
+                # Look for pattern: word, word, word (at least 2 commas nearby)
+                list_context = text[max(0, start - 50):min(len(text), start + len(name) + 50)]
+                comma_count = list_context.count(',')
+                if comma_count >= 2:
+                    # Likely a tech stack list
+                    in_tech_context = True
+                    break
+            
+            if not in_tech_context:
+                filtered.append(cand)
+        
+        return filtered
 
-        scored = self._score_candidates(candidates, text_norm)
-        chosen = max(scored, key=lambda c: c["score_total"], default=None)
-
-        variants: Set[str] = set()
-        initials_patterns: List[str] = []
-        chosen_name = ""
-
-        if chosen and chosen.get("name"):
-            chosen_name = chosen["name"]
-            variants = self._derive_variants(chosen_name, text_norm)
-            if self.config.enable_initials:
-                initials_patterns = self._build_initials_patterns(variants, text_norm)
-
-        debug_info = {
-            "chosen_name": chosen_name,
-            "chosen_source": chosen.get("source") if chosen else None,
-            "chosen_score_total": chosen.get("score_total") if chosen else None,
-            "chosen_score_breakdown": chosen.get("score_breakdown") if chosen else None,
-            "candidates_top": sorted(scored, key=lambda c: c["score_total"], reverse=True)[:10],
-            "masked_variants": sorted(variants, key=len, reverse=True),
-            "masked_initials_patterns": initials_patterns,
-        }
-
-        return {
-            "chosen_name": chosen_name,
-            "variants": variants,
-            "initials_patterns": initials_patterns,
-            "debug": debug_info,
-        }
-
-    def _candidates_from_person_spans(
+    def from_person_spans(
         self,
         text: str,
         results: Sequence[RecognizerResult],
         address_spans: Sequence[Tuple[int, int]],
     ) -> List[Dict]:
+        """Extract candidates from Presidio PERSON entities."""
         out: List[Dict] = []
         for r in results:
             if r.entity_type != "PERSON":
@@ -248,21 +535,60 @@ class PrimaryIdentityResolver:
             frag = _norm_space(text[r.start:r.end])
             if not frag or len(frag) < 3:
                 continue
-            if _contains_address_markers(frag):
+            if AddressFilter.should_exclude(frag):
                 continue
+            # Filter out technology names
+            if TechnologyFilter.should_exclude(frag):
+                continue
+            
+            # Clean name boundaries - remove common labels/prefixes
+            cleaned_frag = self._clean_name_boundaries(frag, text, r.start, r.end)
+            if not cleaned_frag or len(cleaned_frag) < 3:
+                continue
+            
             out.append({
-                "name": frag,
+                "name": cleaned_frag,
                 "source": "presidio_person",
                 "meta": {"start": r.start, "end": r.end, "score": r.score},
             })
         return out
 
-    def _candidates_from_header_lines(self, lines: List[str]) -> List[Dict]:
-        out: List[Dict] = []
+    def _clean_name_boundaries(self, frag: str, full_text: str, start: int, end: int) -> str:
+        """
+        Clean name boundaries to remove common labels/prefixes like "Office:", "Mobile:", etc.
+        """
+        # Common labels that shouldn't be part of names
+        label_patterns = [
+            r"^(office|mobile|phone|email|address|contact|tel|fax)[:\s]*",
+            r"[:\s]*(office|mobile|phone|email|address|contact|tel|fax)$",
+        ]
+        
+        cleaned = frag
+        for pattern in label_patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+        
+        # Split into words and filter out label words
+        words = cleaned.split()
+        filtered_words = []
+        label_words = {"office", "mobile", "phone", "email", "address", "contact", "tel", "fax"}
+        
+        for word in words:
+            word_clean = _strip_name_token(word)
+            if word_clean and _safe_lower(word_clean) not in label_words:
+                filtered_words.append(word_clean)
+        
+        # If we removed words, return the cleaned version
+        if len(filtered_words) < len(words):
+            return " ".join(filtered_words)
+        
+        return cleaned.strip()
 
+    def from_header_lines(self, lines: List[str]) -> List[Dict]:
+        """Extract candidates from header lines (first 20 lines)."""
+        out: List[Dict] = []
         contact_zone_start: Optional[int] = None
         for i, raw in enumerate(lines[:60]):
-            if re.search(r"\b(contact|kontakt|address|adresse|email|e-mail|phone|telefon)\b", raw, flags=re.IGNORECASE):
+            if re.search(PatternRegistry.CONTACT_ZONE, raw, flags=re.IGNORECASE):
                 contact_zone_start = i
                 break
 
@@ -272,7 +598,7 @@ class PrimaryIdentityResolver:
             line = _norm_space(raw)
             if not line or len(line) > 70:
                 continue
-            if _contains_address_markers(line):
+            if AddressFilter.should_exclude(line):
                 continue
 
             words = [w for w in re.split(r"\s+", line) if w]
@@ -281,23 +607,26 @@ class PrimaryIdentityResolver:
                 w_clean = _strip_name_token(normalize_text_for_matching(w))
                 if not w_clean:
                     continue
-                if self._TITLE_CASE_WORD.match(w_clean) or re.match(r"^[A-ZÄÖÜ][a-zäöüß]+(?:[-'][A-ZÄÖÜa-zäöüß]+)+$", w_clean):
+                if self._TITLE_CASE_WORD.match(w_clean) or re.match(PatternRegistry.TITLE_CASE_COMPOUND, w_clean):
                     if _safe_lower(w_clean) not in self._STOPWORDS:
                         name_like.append(w_clean)
 
             if len(name_like) >= 2:
                 cand = " ".join(name_like[:4])
-                if _contains_address_markers(cand):
+                if AddressFilter.should_exclude(cand):
+                    continue
+                # Filter out technology names
+                if TechnologyFilter.should_exclude(cand):
                     continue
                 out.append({
                     "name": cand,
                     "source": "header_line",
                     "meta": {"line_idx": i, "line": line},
                 })
-
         return out
 
-    def _candidates_from_emails(self, emails: Sequence[str]) -> List[Dict]:
+    def from_emails(self, emails: Sequence[str]) -> List[Dict]:
+        """Extract candidates from email local parts."""
         out: List[Dict] = []
         for e in emails:
             local = e.split("@", 1)[0]
@@ -314,7 +643,8 @@ class PrimaryIdentityResolver:
                 out.append({"name": parts[0].capitalize(), "source": "email_localpart_weak", "meta": {"email": e, "local": local}})
         return out
 
-    def _candidates_from_linkedin(self, urls: Sequence[str]) -> List[Dict]:
+    def from_linkedin(self, urls: Sequence[str]) -> List[Dict]:
+        """Extract candidates from LinkedIn profile URLs."""
         out: List[Dict] = []
         for u in urls:
             handle = self._extract_linkedin_handle(u)
@@ -332,15 +662,74 @@ class PrimaryIdentityResolver:
 
     @staticmethod
     def _extract_linkedin_handle(url: str) -> Optional[str]:
-        m = re.search(r"linkedin\.com/(?:in|pub)/([^/?#\s]+)", url, flags=re.IGNORECASE)
+        m = re.search(PatternRegistry.LINKEDIN_HANDLE_EXTRACT, url, flags=re.IGNORECASE)
         return m.group(1) if m else None
 
-    def _score_candidates(self, candidates: List[Dict], text: str) -> List[Dict]:
-        scored: List[Dict] = []
 
+# -----------------------------
+# Name Scorer
+# -----------------------------
+
+class NameScorer:
+    """
+    Scores name candidates using configurable weights.
+    Replaces magic numbers with named constants.
+    """
+    # Source weights
+    SOURCE_WEIGHTS = {
+        "presidio_person": 60.0,
+        "header_line": 40.0,
+        "linkedin_handle": 18.0,
+        "email_localpart": 14.0,
+        "email_localpart_weak": 6.0,
+        "default": 5.0,
+    }
+    
+    # Token count bonuses/penalties
+    TOKEN_COUNT_OPTIMAL_MIN = 2
+    TOKEN_COUNT_OPTIMAL_MAX = 4
+    TOKEN_COUNT_OPTIMAL_BONUS = 25.0
+    TOKEN_COUNT_SINGLE_BONUS = 5.0
+    TOKEN_COUNT_TOO_MANY_PENALTY = -10.0
+    
+    # Stopword penalty
+    STOPWORD_PENALTY_PER_TOKEN = 25.0
+    
+    # Header position bonuses/penalties
+    HEADER_POSITION_BONUS_BASE = 25.0
+    HEADER_POSITION_BONUS_DECAY = 3.0
+    HEADER_POSITION_LATE_PENALTY = -15.0
+    HEADER_POSITION_LATE_THRESHOLD = 6
+    
+    # Presidio score bonus
+    PRESIDIO_SCORE_MULTIPLIER = 20.0
+    PRESIDIO_SCORE_MAX_BONUS = 20.0
+    
+    # Frequency bonus
+    FREQUENCY_MIN_OCCURRENCES = 2
+    FREQUENCY_BONUS_PER_TOKEN = 5.0
+    FREQUENCY_MAX_BONUS = 20.0
+    
+    # Digits penalty
+    DIGITS_PENALTY = -30.0
+    
+    # Common word penalty (for words like Office, Mobile, etc.)
+    COMMON_WORD_PENALTY = -40.0
+    COMMON_WORDS = {"office", "mobile", "phone", "email", "address", "contact", "tel", "fax"}
+    
+    # Proper name bonus (title case, 2-4 tokens, no digits, no common words)
+    PROPER_NAME_BONUS = 15.0
+
+    def __init__(self, config: AnonymizeConfig):
+        self.config = config
+        self._stopwords = NameCandidateExtractor._STOPWORDS
+
+    def score_all(self, candidates: List[Dict], text: str) -> List[Dict]:
+        """Score all candidates and return sorted by score."""
+        scored: List[Dict] = []
         for c in candidates:
             name = normalize_text_for_matching(_norm_space(c["name"]))
-            if _contains_address_markers(name):
+            if AddressFilter.should_exclude(name):
                 continue
 
             tokens = [_strip_name_token(t) for t in re.split(r"\s+", name) if t]
@@ -349,65 +738,81 @@ class PrimaryIdentityResolver:
             breakdown: Dict[str, float] = {}
             score = 0.0
 
+            # Source weight
             src = c.get("source", "")
-            src_weight = {
-                "presidio_person": 60,
-                "header_line": 40,
-                "linkedin_handle": 18,
-                "email_localpart": 14,
-                "email_localpart_weak": 6,
-            }.get(src, 5)
+            src_weight = self.SOURCE_WEIGHTS.get(src, self.SOURCE_WEIGHTS["default"])
             score += src_weight
             breakdown["source_weight"] = src_weight
 
-            if 2 <= len(tokens) <= 4:
-                score += 25
-                breakdown["token_count_bonus"] = 25
+            # Token count bonus/penalty
+            if self.TOKEN_COUNT_OPTIMAL_MIN <= len(tokens) <= self.TOKEN_COUNT_OPTIMAL_MAX:
+                score += self.TOKEN_COUNT_OPTIMAL_BONUS
+                breakdown["token_count_bonus"] = self.TOKEN_COUNT_OPTIMAL_BONUS
             elif len(tokens) == 1:
-                score += 5
-                breakdown["token_count_bonus"] = 5
+                score += self.TOKEN_COUNT_SINGLE_BONUS
+                breakdown["token_count_bonus"] = self.TOKEN_COUNT_SINGLE_BONUS
             else:
-                score -= 10
-                breakdown["token_count_bonus"] = -10
+                score += self.TOKEN_COUNT_TOO_MANY_PENALTY
+                breakdown["token_count_bonus"] = self.TOKEN_COUNT_TOO_MANY_PENALTY
 
+            # Stopword penalty
             stop_pen = 0.0
             for t in tokens:
-                if _safe_lower(t) in self._STOPWORDS:
-                    stop_pen += 25.0
+                if _safe_lower(t) in self._stopwords:
+                    stop_pen += self.STOPWORD_PENALTY_PER_TOKEN
             if stop_pen:
                 score -= stop_pen
                 breakdown["stopword_penalty"] = -stop_pen
 
+            # Header position bonus
             if src == "header_line":
                 li = int(c.get("meta", {}).get("line_idx", 999))
-                if li <= 6:
-                    pos_bonus = max(0, 25 - (li * 3))
+                if li <= self.HEADER_POSITION_LATE_THRESHOLD:
+                    pos_bonus = max(0, self.HEADER_POSITION_BONUS_BASE - (li * self.HEADER_POSITION_BONUS_DECAY))
                     score += pos_bonus
                     breakdown["position_bonus"] = pos_bonus
                 else:
-                    score -= 15
-                    breakdown["late_header_penalty"] = -15
+                    score += self.HEADER_POSITION_LATE_PENALTY
+                    breakdown["late_header_penalty"] = self.HEADER_POSITION_LATE_PENALTY
 
+            # Presidio score bonus
             if src == "presidio_person":
                 ps = float(c.get("meta", {}).get("score", 0.0))
-                ps_bonus = min(20.0, ps * 20.0)
+                ps_bonus = min(self.PRESIDIO_SCORE_MAX_BONUS, ps * self.PRESIDIO_SCORE_MULTIPLIER)
                 score += ps_bonus
                 breakdown["presidio_score_bonus"] = ps_bonus
 
+            # Frequency bonus
             freq_bonus = 0.0
             for t in tokens:
                 if len(t) < self.config.min_name_token_len:
                     continue
                 cnt = len(re.findall(rf"\b{re.escape(t)}\b", text, flags=re.IGNORECASE))
-                if cnt >= 2:
-                    freq_bonus += 5.0
+                if cnt >= self.FREQUENCY_MIN_OCCURRENCES:
+                    freq_bonus += self.FREQUENCY_BONUS_PER_TOKEN
             if freq_bonus:
-                score += min(20.0, freq_bonus)
-                breakdown["frequency_bonus"] = min(20.0, freq_bonus)
+                score += min(self.FREQUENCY_MAX_BONUS, freq_bonus)
+                breakdown["frequency_bonus"] = min(self.FREQUENCY_MAX_BONUS, freq_bonus)
 
+            # Digits penalty
             if re.search(r"\d", name):
-                score -= 30.0
-                breakdown["digits_penalty"] = -30.0
+                score += self.DIGITS_PENALTY
+                breakdown["digits_penalty"] = self.DIGITS_PENALTY
+
+            # Common word penalty (Office, Mobile, etc.)
+            name_lower = _safe_lower(name)
+            has_common_word = any(word in self.COMMON_WORDS for word in name_lower.split())
+            if has_common_word:
+                score += self.COMMON_WORD_PENALTY
+                breakdown["common_word_penalty"] = self.COMMON_WORD_PENALTY
+
+            # Proper name bonus: title case, 2-4 tokens, no digits, no common words
+            if (2 <= len(tokens) <= 4 and
+                not re.search(r"\d", name) and
+                not has_common_word and
+                all(t[0].isupper() if t else False for t in tokens if t)):
+                score += self.PROPER_NAME_BONUS
+                breakdown["proper_name_bonus"] = self.PROPER_NAME_BONUS
 
             scored.append({
                 **c,
@@ -417,6 +822,7 @@ class PrimaryIdentityResolver:
                 "score_breakdown": breakdown,
             })
 
+        # Deduplicate by name (keep highest scoring)
         best_by_name: Dict[str, Dict] = {}
         for c in scored:
             key = _safe_lower(c["name"])
@@ -425,7 +831,22 @@ class PrimaryIdentityResolver:
 
         return list(best_by_name.values())
 
-    def _derive_variants(self, chosen_name: str, full_text: str) -> Set[str]:
+
+# -----------------------------
+# Name Variant Generator
+# -----------------------------
+
+class NameVariantGenerator:
+    """
+    Generates name variants and initials patterns for masking.
+    """
+    _STOPWORDS = NameCandidateExtractor._STOPWORDS
+
+    def __init__(self, config: AnonymizeConfig):
+        self.config = config
+
+    def derive_variants(self, chosen_name: str, full_text: str) -> Set[str]:
+        """Generate all variants of a name for masking."""
         chosen_name = normalize_text_for_matching(chosen_name)
         tokens_raw = [t for t in re.split(r"\s+", chosen_name) if t]
 
@@ -447,7 +868,20 @@ class PrimaryIdentityResolver:
         variants.add(clean[0])
         if len(clean) >= 2:
             variants.add(clean[-1])
+            # Add middle names if present
+            if len(clean) > 2:
+                for middle in clean[1:-1]:
+                    variants.add(middle)
 
+        # Handle hyphenated names
+        for token in clean:
+            if "-" in token:
+                parts = token.split("-")
+                for part in parts:
+                    if len(part) >= self.config.min_name_token_len:
+                        variants.add(part)
+
+        # First name prefixes
         first = clean[0]
         for k in range(4, len(first)):
             pref = first[:k]
@@ -456,9 +890,15 @@ class PrimaryIdentityResolver:
             if re.search(rf"\b{re.escape(pref)}\b", full_text, flags=re.IGNORECASE):
                 variants.add(pref)
 
+        # Reversed name order (last, first)
+        if len(clean) >= 2:
+            reversed_name = f"{clean[-1]} {clean[0]}"
+            variants.add(reversed_name)
+
         return {v for v in variants if len(v) >= self.config.min_name_token_len}
 
-    def _build_initials_patterns(self, variants: Set[str], full_text: str) -> List[str]:
+    def build_initials_patterns(self, variants: Set[str], full_text: str) -> List[str]:
+        """Build regex patterns for matching initials."""
         full = max(variants, key=len, default="")
         toks = [t for t in full.split() if t]
         if len(toks) < 2:
@@ -485,6 +925,66 @@ class PrimaryIdentityResolver:
 
 
 # -----------------------------
+# Primary Identity Resolver
+# -----------------------------
+
+class PrimaryIdentityResolver:
+    def __init__(self, config: AnonymizeConfig):
+        self.config = config
+        self.extractor = NameCandidateExtractor()
+        self.scorer = NameScorer(config)
+        self.variant_generator = NameVariantGenerator(config)
+
+    def resolve(
+        self,
+        text: str,
+        presidio_results: Sequence[RecognizerResult],
+        extracted_urls: Sequence[str],
+        extracted_emails: Sequence[str],
+    ) -> Dict:
+        """Resolve primary identity using extractor, scorer, and variant generator."""
+        text_norm = normalize_text_for_matching(text)
+
+        # Extract candidates from all sources
+        candidates = self.extractor.extract_all(
+            text_norm, presidio_results, extracted_urls, extracted_emails
+        )
+
+        # Score candidates
+        scored = self.scorer.score_all(candidates, text_norm)
+        chosen = max(scored, key=lambda c: c["score_total"], default=None)
+
+        # Generate variants and initials patterns
+        variants: Set[str] = set()
+        initials_patterns: List[str] = []
+        chosen_name = ""
+
+        if chosen and chosen.get("name"):
+            chosen_name = chosen["name"]
+            variants = self.variant_generator.derive_variants(chosen_name, text_norm)
+            if self.config.enable_initials:
+                initials_patterns = self.variant_generator.build_initials_patterns(variants, text_norm)
+
+        debug_info = {
+            "chosen_name": chosen_name,
+            "chosen_source": chosen.get("source") if chosen else None,
+            "chosen_score_total": chosen.get("score_total") if chosen else None,
+            "chosen_score_breakdown": chosen.get("score_breakdown") if chosen else None,
+            "candidates_top": sorted(scored, key=lambda c: c["score_total"], reverse=True)[:10],
+            "masked_variants": sorted(variants, key=len, reverse=True),
+            "masked_initials_patterns": initials_patterns,
+        }
+
+        return {
+            "chosen_name": chosen_name,
+            "variants": variants,
+            "initials_patterns": initials_patterns,
+            "debug": debug_info,
+        }
+
+
+
+# -----------------------------
 # CvAnonymizer
 # -----------------------------
 
@@ -499,9 +999,7 @@ class CvAnonymizer:
         "LOCATION": 10,
     }
 
-    _URL_FIND_RE = re.compile(
-        r"\bhttps?://[^\s<>()\[\]\"']{6,}\b|\b(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:/[^\s<>()\[\]\"']*)?\b"
-    )
+    _URL_FIND_RE = re.compile(PatternRegistry.URL_FIND)
 
     def __init__(self, config: Optional[AnonymizeConfig] = None):
         self.config = config or AnonymizeConfig()
@@ -527,13 +1025,39 @@ class CvAnonymizer:
         if not text:
             return text
 
+        # Apply PII obfuscation limit if configured
+        if self.config.pii_obfuscation_limit > 0 and len(text) > self.config.pii_obfuscation_limit:
+            # Only anonymize the first N characters
+            text_to_anonymize = text[:self.config.pii_obfuscation_limit]
+            text_remainder = text[self.config.pii_obfuscation_limit:]
+            
+            # Anonymize only the first part
+            anonymized_part = self._anonymize_text(text_to_anonymize, preferred_language)
+            
+            # Return anonymized part + original remainder
+            return anonymized_part + text_remainder
+        else:
+            # Process entire text (no limit)
+            return self._anonymize_text(text, preferred_language)
+    
+    def _anonymize_text(self, text: str, preferred_language: str = "de") -> str:
+        """
+        Internal method that performs the actual anonymization.
+        Separated to allow limiting obfuscation to a portion of text.
+        """
+        if not text:
+            return text
+
         text_norm = normalize_text_for_matching(text)
 
         # 1) Analyze (multi-lang)
         results = self._analyze_multi_pass(text_norm, preferred_language=preferred_language)
 
-        # 2) Drop risky phone detections BEFORE overlap collapsing and BEFORE anonymization
-        results = self._filter_phone_results(results, text_norm)
+        # 2) Filter out phone numbers that are actually dates
+        results = self._filter_date_like_phones(results, text_norm)
+        
+        # 2b) Filter out PERSON entities that are technology names
+        results = self._filter_technology_persons(results, text_norm)
 
         # 3) Collapse overlaps (priority-based)
         collapsed = self._collapse_overlaps(results, text_norm)
@@ -559,29 +1083,23 @@ class CvAnonymizer:
         if self.config.enable_initials and resolved["initials_patterns"]:
             out = self._mask_initials(out, resolved["initials_patterns"], label="<PERSON>")
 
-        # 6) Final URL anti-leak pass
-        out = self._apply_url_policy(out)
+        # 6) Combined URL policy + postprocessing pass
+        out = self._apply_url_policy_and_postprocess(out)
 
         # 7) Debug
         if self.config.debug:
             self._print_debug(resolved)
 
-        # 8) Final cleanup pass
-        out = self.postprocess(out)
         return out
 
     # -----------------------
-    # NEW: Phone filtering (avoid dates/years being masked)
+    # Phone date filtering
     # -----------------------
 
-    def _filter_phone_results(self, results: Sequence[RecognizerResult], text: str) -> List[RecognizerResult]:
+    def _filter_date_like_phones(self, results: Sequence[RecognizerResult], text: str) -> List[RecognizerResult]:
         """
-        Drop PHONE_NUMBER spans unless they look like real phones in CV context.
-
-        Rules:
-          - Must have at least config.min_phone_digits digits in the span
-          - If config.drop_phone_if_date_like is True, reject spans that look like dates
-            (month/year, year/month, month/year ranges, or any year token)
+        Filter out PHONE_NUMBER entities that are actually dates.
+        This is a post-filter to catch date patterns that the regex didn't exclude.
         """
         if not results:
             return []
@@ -592,35 +1110,123 @@ class CvAnonymizer:
                 out.append(r)
                 continue
 
-            span = text[r.start:r.end]
-            digits = _digits_only(span)
-
-            if len(digits) < self.config.min_phone_digits:
+            span_text = text[r.start:r.end]
+            
+            # Check if this looks like a date using the date patterns
+            if (PatternRegistry.DATE_MONTH_YEAR.search(span_text) or
+                PatternRegistry.DATE_YEAR_MONTH.search(span_text) or
+                PatternRegistry.DATE_YEAR_RANGE.search(span_text) or
+                PatternRegistry.DATE_MONTHYEAR_RANGE.search(span_text)):
+                # This is a date, not a phone number
                 continue
 
-            if self.config.drop_phone_if_date_like and _is_date_like_phone_span(span):
+            # Also check if the span contains a year pattern (19xx or 20xx)
+            if re.search(r"\b(?:19|20)\d{2}\b", span_text):
+                # Contains a year, likely a date
                 continue
+            
+            out.append(r)
+        
+        return out
+    
+    def _filter_technology_persons(self, results: Sequence[RecognizerResult], text: str) -> List[RecognizerResult]:
+        """
+        Filter out PERSON and LOCATION entities that are actually technology/product names or city names.
+        This prevents tech names and cities from being incorrectly masked.
+        """
+        if not results:
+            return []
+        
+        out: List[RecognizerResult] = []
+        for r in results:
+            # Filter PERSON entities that are cities or tech names
+            if r.entity_type == "PERSON":
+                span_text = _norm_space(text[r.start:r.end])
+                
+                # Check if this is a city name (misclassified as PERSON)
+                if CityNameFilter.should_exclude(span_text):
+                    # This is a city, not a person - but keep it as LOCATION would be correct
+                    # Actually, we should exclude it from PERSON masking
+                    continue
+                
+                # Check if this is a technology name
+                if TechnologyFilter.should_exclude(span_text):
+                    # This is a tech name, not a person
+                    continue
+                
+                # Also check context - if it's in a tech stack context, exclude it
+                context_start = max(0, r.start - 50)
+                context_end = min(len(text), r.end + 50)
+                context = text[context_start:context_end].lower()
+                
+                tech_context_patterns = [
+                    r"used\s+tech[:\s]",
+                    r"technologies[:\s]",
+                    r"tech\s+stack[:\s]",
+                    r"skills[:\s]",
+                    r"tools[:\s]",
+                    r"eingesetzte\s+technologien[:\s]",  # German: "Used technologies"
+                    r"technologien[:\s]",  # German: "Technologies"
+                ]
+                
+                in_tech_context = any(re.search(pattern, context) for pattern in tech_context_patterns)
+                if in_tech_context:
+                    # In tech context, likely not a person name
+                    continue
+            
+            # Filter LOCATION entities that are technology names
+            elif r.entity_type == "LOCATION":
+                span_text = _norm_space(text[r.start:r.end])
+                
+                # Check if this is a technology name (misclassified as LOCATION)
+                if TechnologyFilter.should_exclude(span_text):
+                    # This is a tech name, not a location
+                    continue
 
             out.append(r)
 
         return out
 
     # -----------------------
-    # Postprocess (member function)
+    # Combined URL policy + postprocessing
     # -----------------------
 
-    def postprocess(self, text: str) -> str:
+    def _apply_url_policy_and_postprocess(self, text: str) -> str:
         """
-        Final readability cleanup after multi-pass anonymization.
-
-        - Collapses repeated tags: "<PERSON> <PERSON>" -> "<PERSON>"
-        - Fixes spaces before punctuation: "<PERSON> ," -> "<PERSON>,"
-        - Limits blank lines
+        Combined pass: applies URL policy and postprocessing in a single traversal.
+        More efficient than separate passes.
         """
         if not text:
             return text
 
-        out = text
+        # First apply URL policy
+        policy = self.config.url_policy
+
+        def url_repl(m: re.Match) -> str:
+            raw = m.group(0)
+            if raw.startswith("<") and raw.endswith(">"):
+                return raw
+
+            domain, has_path = self._parse_domain_and_path(raw)
+            if not domain:
+                return "<URL>"
+
+            if policy == "redact_all":
+                return "<URL>"
+
+            if policy == "keep_domain":
+                return f"{domain}/<PATH>" if has_path else domain
+
+            if policy == "allowlist_domains_keep_domain":
+                if domain in self.config.url_domain_allowlist:
+                    return f"{domain}/<PATH>" if has_path else domain
+                return "<URL>"
+
+            return "<URL>"
+
+        out = self._URL_FIND_RE.sub(url_repl, text)
+
+        # Then apply postprocessing cleanup
         tags = {
             "<PERSON>",
             "<ADDRESS>",
@@ -651,6 +1257,13 @@ class CvAnonymizer:
 
         return out
 
+    def postprocess(self, text: str) -> str:
+        """
+        Legacy method for backward compatibility.
+        Delegates to combined method (URL policy with default settings).
+        """
+        return self._apply_url_policy_and_postprocess(text)
+
     # -----------------------
     # Analyzer + recognizers
     # -----------------------
@@ -668,75 +1281,62 @@ class CvAnonymizer:
         return analyzer
 
     def _add_regex_recognizers(self, analyzer: AnalyzerEngine) -> None:
+        """Add all regex-based recognizers using patterns from PatternRegistry."""
+        
+        # Email addresses
         analyzer.registry.add_recognizer(
             PatternRecognizer(
                 supported_entity="EMAIL_ADDRESS",
                 supported_language="en",
                 patterns=[
-                    Pattern("email", r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\b", 0.95),
-                    Pattern(
-                        "email_obf",
-                        r"\b[a-zA-Z0-9_.+-]+\s*(?:\(|\[)?\s*(?:at|@)\s*(?:\)|\])?\s*[a-zA-Z0-9-]+\s*(?:\(|\[)?\s*(?:dot|\.)\s*(?:\)|\])?\s*[a-zA-Z0-9-.]+\b",
-                        0.75,
-                    ),
+                    Pattern("email", PatternRegistry.EMAIL_STANDARD, 0.95),
+                    Pattern("email_obf", PatternRegistry.EMAIL_OBFUSCATED, 0.75),
                 ],
             )
         )
 
-        # NOTE:
-        # We keep the phone recognizer permissive, and rely on _filter_phone_results to prevent
-        # dates/years from being masked as <PHONE>.
+        # Phone numbers (stricter pattern to avoid dates)
         analyzer.registry.add_recognizer(
             PatternRecognizer(
                 supported_entity="PHONE_NUMBER",
                 supported_language="en",
                 patterns=[
-                    Pattern(
-                        "phone_candidate",
-                        r"\b(?:\+?\d{1,3}[\s().-]?)?(?:\(?\d{2,5}\)?[\s().-]?)?\d[\d\s().-]{6,}\d\b",
-                        0.80,
-                    )
+                    Pattern("phone_strict", PatternRegistry.PHONE_STRICT, 0.85)
                 ],
             )
         )
 
-        street_types = r"(?:straße|strasse|str\.|weg|allee|gasse|platz|ring|damm|ufer)"
+        # German addresses
         analyzer.registry.add_recognizer(
             PatternRecognizer(
                 supported_entity="ADDRESS",
                 supported_language="de",
                 patterns=[
-                    Pattern(
-                        "de_address_full",
-                        rf"\b[A-ZÄÖÜ][\wÄÖÜäöüß\.\- ]{{2,}}?{street_types}\s+\d{{1,4}}[a-zA-Z]?\s*,?\s*\d{{5}}\s+[A-ZÄÖÜ][\wÄÖÜäöüß\.\- ]{{1,}}\b",
-                        0.85,
-                    ),
-                    Pattern("de_zip_city", r"\b\d{5}\s+[A-ZÄÖÜ][\wÄÖÜäöüß\- ]{2,}\b", 0.50),
+                    Pattern("de_address_full", PatternRegistry.ADDRESS_FULL_DE, 0.85),
+                    Pattern("de_zip_city", PatternRegistry.ADDRESS_ZIP_CITY_DE, 0.50),
                 ],
             )
         )
 
+        # LinkedIn profiles
         analyzer.registry.add_recognizer(
             PatternRecognizer(
                 supported_entity="LINKEDIN_PROFILE",
                 supported_language="en",
                 patterns=[
-                    Pattern(
-                        "linkedin_profile_any",
-                        r"\b(?:https?://)?(?:[a-z]{2,3}\.)?linkedin\.com/(?:in|pub)/[A-Za-z0-9\-_%/]+/?\b",
-                        0.95,
-                    )
+                    Pattern("linkedin_profile_any", PatternRegistry.LINKEDIN_PROFILE, 0.95)
                 ],
             )
         )
 
+        # URLs
         analyzer.registry.add_recognizer(
             PatternRecognizer(
                 supported_entity="URL",
                 supported_language="en",
                 patterns=[
-                    Pattern("url_scheme", r"\bhttps?://[^\s<>()\[\]\"']{6,}\b", 0.85),
-                    Pattern("url_bare", r"\b(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:/[^\s<>()\[\]\"']*)?\b", 0.70),
+                    Pattern("url_scheme", PatternRegistry.URL_SCHEME, 0.85),
+                    Pattern("url_bare", PatternRegistry.URL_BARE, 0.70),
                 ],
             )
         )
@@ -819,36 +1419,6 @@ class CvAnonymizer:
             out = re.sub(pat, label, out)
         return out
 
-    # -----------------------
-    # URL policy
-    # -----------------------
-
-    def _apply_url_policy(self, text: str) -> str:
-        policy = self.config.url_policy
-
-        def repl(m: re.Match) -> str:
-            raw = m.group(0)
-            if raw.startswith("<") and raw.endswith(">"):
-                return raw
-
-            domain, has_path = self._parse_domain_and_path(raw)
-            if not domain:
-                return "<URL>"
-
-            if policy == "redact_all":
-                return "<URL>"
-
-            if policy == "keep_domain":
-                return f"{domain}/<PATH>" if has_path else domain
-
-            if policy == "allowlist_domains_keep_domain":
-                if domain in self.config.url_domain_allowlist:
-                    return f"{domain}/<PATH>" if has_path else domain
-                return "<URL>"
-
-            return "<URL>"
-
-        return self._URL_FIND_RE.sub(repl, text)
 
     @staticmethod
     def _parse_domain_and_path(raw: str) -> Tuple[Optional[str], bool]:
@@ -941,8 +1511,15 @@ Projects:
     
 2/2025 - 12/2025
 My last Java project    
+used tech: Java, Python, JavaScript, Oracle, MySQL, Kafka, Anthropic    
+2/1997 - 12/1998
+My first Java project für eine 'Duale Hochschule
+
+Used tech: Python, Jenkins, Crew AI, JavaScript, Oracle, MySQL
 2/1997 - 12/1998
 My first Java project
+Verwendung von Prometheus für tracking
+Used tech: Python, Jenkins, Crew AI, JavaScript, Oracle, MySQL, Gradle    
 """
     anon = CvAnonymizer(AnonymizeConfig(debug=True, url_policy="keep_domain"))
     print(anon.anonymize(sample, preferred_language="de"))

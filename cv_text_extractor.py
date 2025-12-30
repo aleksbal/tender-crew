@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from collections import Counter
 import re
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
-import pymupdf  # PyMuPDF
+import pymupdf
 
 
 _FORM_FEED = "\f"
@@ -120,7 +120,7 @@ def extract_plain_text(path: Path) -> str:
 
             # IMPORTANT: keep the SAME extraction mode that flattens your tables well.
             # (You can toggle sort=True if you see ordering glitches on some PDFs.)
-            text = page.get_text(clip=clip)
+            text = page.get_text(clip=clip, sort=True)
 
             result_text.append(text)
             result_text.append(_FORM_FEED)
@@ -145,4 +145,4 @@ def postprocess(text: str) -> str:
 
 
 if __name__ == "__main__":
-    print(extract_plain_text(Path("cv/cv_daniel_heid_web.pdf")))
+    print(extract_plain_text(Path("cv/cvd.pdf")))
