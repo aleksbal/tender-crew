@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # NOTE: adapt this import if your filename differs
 import cv_deterministic_processor as tchunk
-from mymupdf_extractor import extract_plain_text
+from cv_text_extractor import extract_plain_text
 
 # =============================================================================
 # Configuration: one place to plug your chunker function name
@@ -562,7 +562,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python cv_converter_service.py /path/to/cv.pdf|cv.docx")
+        print("Usage: python cv_deterministic_converter.py /path/to/cv.pdf|cv.docx")
         raise SystemExit(2)
 
     p = sys.argv[1]

@@ -928,13 +928,21 @@ class CvAnonymizer:
 # -----------------------------
 if __name__ == "__main__":
     sample = """
-2/1997 - 12/1998
-
+Lebenslauf
+    
+Aleksandar Herman Balaban     
 Office: 06221 / 123456
 Mobile: +49 171 2345678
 
 Online Producer/Webdeveloper
 selbstständig freiberuflich
+
+Projects:
+    
+2/2025 - 12/2025
+My last Java project    
+2/1997 - 12/1998
+My first Java project
 """
     anon = CvAnonymizer(AnonymizeConfig(debug=True, url_policy="keep_domain"))
     print(anon.anonymize(sample, preferred_language="de"))

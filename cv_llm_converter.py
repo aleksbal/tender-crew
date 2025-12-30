@@ -7,9 +7,9 @@ import subprocess
 from typing import Optional
 from pathlib import Path
 
-from cv_text_scrubber_de import CvAnonymizer, AnonymizeConfig
+from cv_text_scrubber import CvAnonymizer, AnonymizeConfig
 from llm_client import create_llm_client
-from mymupdf_extractor import extract_plain_text
+from cv_text_extractor import extract_plain_text
 
 # Configure logging
 logging.basicConfig(
@@ -32,14 +32,12 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="Extract structured text and redact PII with optional preprocessing")
     p.add_argument("path", help="Path to input file (PDF or DOCX)")
     p.add_argument("-o", "--out", help="Output JSON file (default stdout)")
-    p.add_argument("--pandoc-ast", action="store_true", help="Export pandoc JSON AST for DOCX (requires pandoc installed)")
     p.add_argument("--redact", action="store_true", help="Enable PII redaction (default: disabled)")
-    p.add_argument("--llm", action="store_true", help="Call local Ollama LLM to post-process structured output")
     p.add_argument("--llm-model", default="ollama/llama2", help="LLM model name for local Ollama")
     p.add_argument("--llm-kind", default="ollama", help="LLM provider kind (ollama|openai)")
     p.add_argument("--system-prompt", default="cv_extraction_system_prompt.txt", help="Path to system prompt file")
     p.add_argument("--user-prompt", default="cv_extraction_user_prompt.txt", help="Path to user prompt template file")
-    p.add_argument("--schema", default="schema.json", help="Path to JSON schema to present to LLM")
+    p.add_argument("--schema", default="cv_schema.json", help="Path to JSON schema to present to LLM")
     args = p.parse_args(argv)
 
     src = Path(args.path)
@@ -64,54 +62,48 @@ def main(argv=None):
 
         logger.info(text_for_json)
 
-        llm_response = None
-        if args.llm:
-            logger.info("Starting LLM processing...")
-            logger.info(f"LLM kind: {args.llm_kind}, model: {args.llm_model}")
-            
-            sys_prompt_path = Path(args.system_prompt)
-            usr_prompt_path = Path(args.user_prompt)
-            json_schema_path = Path(args.schema)
-            
-            if not sys_prompt_path.exists():
-                logger.warning(f"System prompt file not found: {sys_prompt_path}")
-            else:
-                logger.info(f"Using system prompt: {sys_prompt_path}")
+        logger.info("Starting LLM processing...")
+        logger.info(f"LLM kind: {args.llm_kind}, model: {args.llm_model}")
 
-            if not usr_prompt_path.exists():
-                logger.warning(f"User prompt file not found: {sys_prompt_path}")
-            else:
-                logger.info(f"Using user prompt: {usr_prompt_path}")
+        sys_prompt_path = Path(args.system_prompt)
+        usr_prompt_path = Path(args.user_prompt)
+        json_schema_path = Path(args.schema)
 
-            if not json_schema_path.exists():
-                logger.warning(f"Schema file not found: {json_schema_path}")
-            else:
-                logger.info(f"Using schema: {json_schema_path}")
-            
-            try:
-                logger.info("Creating LLM client...")
-                client = create_llm_client(
-                    kind=args.llm_kind,
-                    system_prompt_path=args.system_prompt,
-                    user_prompt_path=args.user_prompt,
-                    schema_path=args.schema,
-                    model=args.llm_model,
-                    max_length=4096,
-                    max_retries=3,
-                )
-                logger.info(f"LLM client created: {type(client).__name__}")
-                
-                logger.info("Calling LLM to generate structured output...")
-                llm_response = client.generate_structured(text_for_json)
-                logger.info("LLM processing completed successfully")
-            except Exception as e:
-                logger.error(f"LLM call failed: {e}", exc_info=True)
-                llm_response = f"LLM call error: {e}"
+        if not sys_prompt_path.exists():
+            logger.warning(f"System prompt file not found: {sys_prompt_path}")
+        else:
+            logger.info(f"Using system prompt: {sys_prompt_path}")
 
-        # If LLM was used, the LLM response is the primary output (converted CV JSON)
-        # Otherwise, output the raw extracted structured data
-        # If LLM was used, the LLM response is the primary output (converted CV JSON)
-        # Otherwise, output the raw extracted structured data
+        if not usr_prompt_path.exists():
+            logger.warning(f"User prompt file not found: {sys_prompt_path}")
+        else:
+            logger.info(f"Using user prompt: {usr_prompt_path}")
+
+        if not json_schema_path.exists():
+            logger.warning(f"Schema file not found: {json_schema_path}")
+        else:
+            logger.info(f"Using schema: {json_schema_path}")
+
+        try:
+            logger.info("Creating LLM client...")
+            client = create_llm_client(
+                kind=args.llm_kind,
+                system_prompt_path=args.system_prompt,
+                user_prompt_path=args.user_prompt,
+                schema_path=args.schema,
+                model=args.llm_model,
+                max_length=4096,
+                max_retries=3,
+            )
+            logger.info(f"LLM client created: {type(client).__name__}")
+
+            logger.info("Calling LLM to generate structured output...")
+            llm_response = client.generate_structured(text_for_json)
+            logger.info("LLM processing completed successfully")
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}", exc_info=True)
+            llm_response = f"LLM call error: {e}"
+
         if llm_response is not None:
             try:
                 # LLM response is the converted CV JSON - this is what we want as output

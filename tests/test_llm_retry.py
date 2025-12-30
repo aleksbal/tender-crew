@@ -21,7 +21,7 @@ def test_generate_structured_retries(monkeypatch, tmp_path):
             # first call -> invalid JSON
             if self.call_count == 1:
                 return "I am not JSON"
-            # second call -> valid JSON that conforms to schema.json (CV format)
+            # second call -> valid JSON that conforms to cv_schema.json (CV format)
             return json.dumps({
                 "personal_info": {
                     "first_name": "Test",
@@ -51,7 +51,7 @@ def test_generate_structured_retries(monkeypatch, tmp_path):
         return client
 
     # patch main's create_llm_client
-    import main as main_mod
+    import cv_llm_converter as main_mod
     monkeypatch.setattr(main_mod, "create_llm_client", fake_factory)
 
     out_file = tmp_path / "out.json"

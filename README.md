@@ -25,7 +25,12 @@ d.add_paragraph("Adresse: Musterstraße 1, 12345 Musterstadt")
 d.add_paragraph("Email: max@example.com")
 d.add_paragraph("Phone: +49 123 4567890")
 d.add_paragraph("Berufserfahrung")
+d.add_paragraph("01/2022 02/2023")
 d.add_paragraph(" - Company A, Developer")
+d.add_paragraph(" - Working on a project with Java, MySQL and Gradle")
+d.add_paragraph("03/2023 12/2025")
+d.add_paragraph(" - Company B, Developer")
+d.add_paragraph(" - Working on a project with Python and PostgreSQL")
 d.save("sample_cv.docx")
 PY
 ```
@@ -33,66 +38,32 @@ PY
 Run extraction + redaction (writes JSON to stdout or use `-o`):
 
 ```bash
-python3 main.py sample_cv.docx -o sample_out.json
-
+python3 cv_llm_converter.py sample_cv.docx --llm --llm-kind ollama --llm-model gpt-oss:120b-cloud -o sample_out.json
 # Pretty-print result
 python3 -m json.tool sample_out.json | less
 ```
 
 Notes
 -----
-- The extractor returns structured output: pages → blocks → lines (with bounding boxes and character spans when available).
-- The redactor accepts the structured form and records redaction metadata (page/block/line indices and char spans).
--- Conversion and preprocessing are delegated to a reusable `converter.py` component so the CLI remains lightweight and the conversion logic can be reused in larger pipelines.
+- The text extractor returns flattened text output, it is in `cv_text_extractor.py` component.
+- CLI (`cv_llm_converter.py`) remains lightweight and the conversion logic can be reused in larger pipelines.
 
 Next steps
 ----------
-- Add OCR fallback (Tesseract) for scanned PDFs.
 - Add more robust heading detection and DOCX style-aware extraction.
+- PII !!!
 - Add unit tests and CI for sample fixtures.
 
 Files of interest
 ---------------
-- `extract_text.py` — extraction helpers and `extract_text_structured()` API.
-- `redactor.py` — `redact_structured()` consuming structured output and producing redaction records.
-- `main.py` — CLI to run extraction + redaction and emit JSON.
+- `cv_text_extractor.py` — uses simple myumpdf + some heuristics to extract plain text from docx and pdf files.
+- `cv_extraction_system_prompt.txt` — extensive explanation to LLM how to parse text and generate JSON document
+- `llm_client.py` — abstracts access to LLM (single question + system prompt + user prompt, Ollama or OpenAPI)
+- `cv_llm_converter.py` — CLI to run extraction + redaction and emit JSON.
 
 License
 -------
 MIT-style (see repo settings).
-
-Preprocessing tools
--------------------
-Some preprocessing features require system binaries. Below are the recommended system packages and how they integrate:
-
-Optional system packages
-
-```bash
-# For certain preprocessing tasks you may want these tools installed:
-sudo apt update
-# PDF toolkit
-sudo apt install -y qpdf
-# Ghostscript / poppler utilities used for PDF handling
-sudo apt install -y ghostscript poppler-utils
-```
-
-Python packages that enable OCR and preprocessing are listed in `requirements.txt` (e.g. `ocrmypdf`, `pytesseract`, `Pillow`). Note: the Python `ocrmypdf` package still requires the system binaries above.
-
-Optional system tools (not required by default):
-
-```bash
-# Pandoc (DOCX -> structured JSON AST)
-sudo apt install -y pandoc
-
-# LibreOffice (soffice) can render DOCX -> PDF if you explicitly want layout bboxes,
-# but it is heavy and not required by default. Avoid unless you need exact visual rendering.
-sudo apt install -y libreoffice  # optional
-```
-
-CLI flags recap:
-
-Note: this project expects searchable PDF and DOCX inputs. OCR and scanned/PDF bitmap fallback are intentionally unsupported.
-- `--pandoc-ast` (DOCX only): produce a `pandoc` JSON AST and include it in the output JSON (requires `pandoc`).
 
 Using OpenAI via `--llm-kind`
 -----------------------------
@@ -100,7 +71,7 @@ You can use OpenAI as the LLM provider by selecting `--llm-kind openai`. The CLI
 
 ```bash
 export OPENAI_API_KEY="sk_your_key_here"
-python3 main.py resume.docx --llm --llm-kind openai --llm-model gpt-4o-mini -o out.json
+python3 cv_llm_converter.py resume.docx --llm --llm-kind openai --llm-model gpt-4o-mini -o out.json
 ```
 
 If `OPENAI_API_KEY` is not set the OpenAI client will raise an error. The default LLM provider remains `ollama`.
