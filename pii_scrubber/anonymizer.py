@@ -18,12 +18,26 @@ from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
-from .config import AnonymizeConfig
-from .utils import norm_space, normalize_text_for_matching, span_overlaps
-from .patterns import PatternRegistry
-from .filters import AddressFilter, CityNameFilter, TechnologyFilter
-from .tracker import ObfuscationTracker
-from .identity import PrimaryIdentityResolver
+# Handle both relative imports (when used as module) and absolute imports (when run directly)
+try:
+    from .config import AnonymizeConfig
+    from .utils import norm_space, normalize_text_for_matching, span_overlaps
+    from .patterns import PatternRegistry
+    from .filters import AddressFilter, CityNameFilter, TechnologyFilter
+    from .tracker import ObfuscationTracker
+    from .identity import PrimaryIdentityResolver
+except ImportError:
+    # Running as script - use absolute imports
+    import sys
+    from pathlib import Path
+    # Add parent directory to path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from pii_scrubber.config import AnonymizeConfig
+    from pii_scrubber.utils import norm_space, normalize_text_for_matching, span_overlaps
+    from pii_scrubber.patterns import PatternRegistry
+    from pii_scrubber.filters import AddressFilter, CityNameFilter, TechnologyFilter
+    from pii_scrubber.tracker import ObfuscationTracker
+    from pii_scrubber.identity import PrimaryIdentityResolver
 
 class TextAnonymizer:
     _ENTITY_PRIORITY = {
@@ -723,16 +737,17 @@ Projects:
 My last Java project    
 used tech: Java, Python, JavaScript, Oracle, MySQL, Kafka, Anthropic    
 2/1997 - 12/1998
-My first Java project für eine 'Duale Hochschule
-
+My first Java project für eine Hochschule
 Used tech: Python, Jenkins, Crew AI, JavaScript, Oracle, MySQL
 2/1997 - 12/1998
 My first Java project
 Verwendung von Prometheus für tracking
 Used tech: Python, Jenkins, Crew AI, JavaScript, Oracle, MySQL, Gradle    
 """
-    anon = TextAnonymizer(AnonymizeConfig(debug=True, url_policy="keep_domain"))
-    result = anon.anonymize(sample, preferred_language="de")
+
+    anonimizer = TextAnonymizer(AnonymizeConfig(debug=True, url_policy="keep_domain", pii_obfuscation_limit=0))
+    result = anonimizer.anonymize(sample, preferred_language="de")
+
     print("=== OBFUSCATED TEXT ===")
     print(result["obfuscated_text"])
     print("\n=== OBFUSCATIONS ===")

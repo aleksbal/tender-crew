@@ -40,7 +40,7 @@ PY
 Run JSON extraction (writes JSON to stdout or use `-o`):
 
 ```bash
-python3 cv_llm_converter.py sample_cv.docx --llm --llm-kind ollama --llm-model gpt-oss:120b-cloud -o sample_out.json
+python3 text_2_json_cli.py sample_cv.docx --llm --llm-kind ollama --llm-model gpt-oss:120b-cloud -o sample_out.json
 # Pretty-print result
 python3 -m json.tool sample_out.json | less
 ```
@@ -132,7 +132,7 @@ You can use OpenAI as the LLM provider by selecting `--llm-kind openai`. The CLI
 
 ```bash
 export OPENAI_API_KEY="sk_your_key_here"
-python3 cv_llm_converter.py resume.docx --llm --llm-kind openai --llm-model gpt-4o-mini -o out.json
+python3 text_2_json_cli.py resume.docx --llm --llm-kind openai --llm-model gpt-4o-mini -o out.json
 ```
 
 If `OPENAI_API_KEY` is not set the OpenAI client will raise an error. The default LLM provider remains `ollama`.
