@@ -83,11 +83,27 @@ AND
 
 If these appear on separate lines, concatenate them into a single string separated by " | ".
 
-TECHNOLOGIES ↔ EVIDENCE COUPLING (STRICT)
-If technologies array for an item is non-empty, evidence MUST also include the corresponding technologies line/row excerpt that lists those technologies (e.g., exactly "Technologien/Werkzeuge:" or the exact label present in the source).
-If the technologies line cannot be quoted verbatim in evidence, set technologies = [] for that item (do NOT infer).
 
-If no suitable excerpt exists, set evidence to "".
+TECHNOLOGY EXTRACTION — ITEM-LOCAL (PATCH)
+
+For each individual experience or project item:
+
+• Technologies MUST be extracted from any text that belongs to that item, including:
+  – role / position title
+  – description paragraphs
+  – bullet points
+  – inline mentions within sentences
+
+• A dedicated or labeled “Technologies:”, “Tools:”, or similar line is NOT required.
+
+• A technology may be included in technologies[] IF AND ONLY IF:
+  – its name appears explicitly and verbatim (case-insensitive) within that item’s own text block.
+
+• Context-trigger rule (allow unknown tech tokens):
+  – If a token X appears in the item text in patterns like “using X / with X / via X / based on X / built with X / implemented with X”, then include X in technologies[] for that item even if X is not a known technology name.
+
+• Technologies MUST NOT be inferred, generalized, normalized, or imported from other sections.
+
 
 SECTION RULES
 
