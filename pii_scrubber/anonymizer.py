@@ -148,19 +148,16 @@ class TextAnonymizer:
 
         # Apply PII obfuscation limit if configured
         if self.config.pii_obfuscation_limit > 0 and len(text) > self.config.pii_obfuscation_limit:
-            # Only anonymize the first N characters
-            text_to_anonymize = text[:self.config.pii_obfuscation_limit]
-            text_remainder = text[self.config.pii_obfuscation_limit:]
+            # NEW APPROACH: Detect PII in first N chars, but apply obfuscation to entire text
+            # This prevents errors when names appear later mixed with technologies
+            text_to_analyze = text[:self.config.pii_obfuscation_limit]
             
-            # Anonymize only the first part
-            result = self._anonymize_text(text_to_anonymize, preferred_language, tracker)
-            
-            # Combine anonymized part + original remainder
-            obfuscated_text = result["obfuscated_text"] + text_remainder
+            # Analyze first N characters to detect PII entities
+            result = self._anonymize_text_with_limit(text, text_to_analyze, preferred_language, tracker)
             
             return {
                 "original_text": text,
-                "obfuscated_text": obfuscated_text,
+                "obfuscated_text": result["obfuscated_text"],
                 "config": self._config_to_dict(),
                 "obfuscations": tracker.get_mappings()
             }
@@ -225,6 +222,142 @@ class TextAnonymizer:
             self._print_debug(resolved)
 
         return {"obfuscated_text": out}
+    
+    def _anonymize_text_with_limit(
+        self, 
+        full_text: str, 
+        text_to_analyze: str, 
+        preferred_language: str, 
+        tracker: ObfuscationTracker
+    ) -> Dict[str, Any]:
+        """
+        Analyze PII in first N characters, but apply obfuscation to entire text.
+        
+        This approach:
+        1. Analyzes only the first N characters to detect PII (where it's most likely)
+        2. Extracts PII values (names, phones, emails) from that analysis
+        3. Applies obfuscation to the ENTIRE text using those detected PII values
+        
+        This prevents errors when names appear later in the document mixed with technologies.
+        
+        Args:
+            full_text: The complete text to obfuscate
+            text_to_analyze: The first N characters to analyze for PII detection
+            preferred_language: Language preference for analysis
+            tracker: Obfuscation tracker
+            
+        Returns:
+            Dict with obfuscated_text
+        """
+        if not full_text:
+            return {"obfuscated_text": full_text}
+        
+        full_text_norm = normalize_text_for_matching(full_text)
+        text_to_analyze_norm = normalize_text_for_matching(text_to_analyze)
+        
+        # 1) Analyze only the first N characters to detect PII entities
+        results = self._analyze_multi_pass(text_to_analyze_norm, preferred_language=preferred_language)
+        
+        # 2) Filter out phone numbers that are actually dates (in analyzed portion)
+        results = self._filter_date_like_phones(results, text_to_analyze_norm)
+        
+        # 2b) Filter out PERSON entities that are technology names
+        # IMPORTANT: Use full_text_norm as context to catch technology names that appear later
+        # This prevents obfuscating "Java" when "JavaScript" appears later in the document
+        results = self._filter_technology_persons_with_full_context(results, text_to_analyze_norm, full_text_norm)
+        
+        # 3) Collapse overlaps (priority-based)
+        collapsed = self._collapse_overlaps(results, text_to_analyze_norm)
+        
+        # Extract URLs and emails from analyzed portion for identity resolution
+        extracted_urls = self._extract_entity_texts(text_to_analyze_norm, results, {"URL", "LINKEDIN_PROFILE"})
+        extracted_emails = self._extract_entity_texts(text_to_analyze_norm, results, {"EMAIL_ADDRESS"})
+        
+        # 4) Resolve primary identity from the analyzed portion FIRST
+        # This extracts the actual PII values (names, variants, initials) that we'll use
+        resolved = self.identity_resolver.resolve(
+            text=text_to_analyze_norm,
+            presidio_results=results,
+            extracted_urls=extracted_urls,
+            extracted_emails=extracted_emails,
+        )
+        
+        # 5) Now apply obfuscation to the ENTIRE text using the detected PII values
+        # Start with the full text
+        out = full_text_norm
+        
+        # First, replace non-PERSON entities (phones, emails, addresses, etc.) throughout entire text
+        # Extract unique PII values from detected entities
+        pii_values = {}  # Map: (entity_type, value_lower) -> (token, original_value)
+        
+        for r in collapsed:
+            entity_type = r.entity_type
+            original_value = norm_space(text_to_analyze_norm[r.start:r.end])
+            
+            if not original_value:
+                continue
+            
+            # Skip PERSON entities here - they'll be handled by variant propagation
+            if entity_type == "PERSON":
+                continue
+            
+            value_key = (entity_type, original_value.lower())
+            if value_key not in pii_values:
+                token = tracker.get_next_token(entity_type)
+                tracker.record_obfuscation(token, original_value)
+                pii_values[value_key] = (token, original_value)
+            else:
+                token = pii_values[value_key][0]
+            
+            # Replace ALL occurrences of this value in the full text (case-insensitive, word boundaries)
+            pattern = rf"\b{re.escape(original_value)}\b"
+            out = re.sub(pattern, token, out, flags=re.IGNORECASE)
+        
+        # 6) Propagate name variants and initials throughout the ENTIRE text
+        # This already handles finding all occurrences in the full text
+        if self.config.propagate_primary_name and resolved["variants"]:
+            out = self._mask_variants_with_tracking(out, full_text_norm, resolved["variants"], tracker)
+        
+        if self.config.enable_initials and resolved["initials_patterns"]:
+            out = self._mask_initials_with_tracking(out, full_text_norm, resolved["initials_patterns"], tracker)
+        
+        # 7) Also replace PERSON entities detected in first N chars throughout entire text
+        # (in case variant propagation didn't catch them all)
+        for r in collapsed:
+            if r.entity_type == "PERSON":
+                original_value = norm_space(text_to_analyze_norm[r.start:r.end])
+                if not original_value:
+                    continue
+                
+                # Check if this value was already obfuscated by variant propagation
+                # by checking if it still appears in the output
+                pattern = rf"\b{re.escape(original_value)}\b"
+                if re.search(pattern, out, flags=re.IGNORECASE):
+                    # Still present, need to obfuscate it
+                    # Find existing token or create new one
+                    existing_token = None
+                    for mapping in tracker.get_mappings():
+                        if mapping["value"].lower() == original_value.lower() and mapping["key"].startswith("PERSON"):
+                            existing_token = f"<{mapping['key']}>"
+                            break
+                    
+                    if not existing_token:
+                        token = tracker.get_next_token("PERSON")
+                        tracker.record_obfuscation(token, original_value)
+                    else:
+                        token = existing_token
+                    
+                    # Replace remaining occurrences
+                    out = re.sub(pattern, token, out, flags=re.IGNORECASE)
+        
+        # 8) Apply URL policy and postprocessing to entire text
+        out = self._apply_url_policy_and_postprocess(out, tracker)
+        
+        # 9) Debug
+        if self.config.debug:
+            self._print_debug(resolved)
+        
+        return {"obfuscated_text": out}
 
     # -----------------------
     # Phone date filtering
@@ -283,15 +416,18 @@ class TextAnonymizer:
                     # Actually, we should exclude it from PERSON masking
                     continue
                 
-                # Check if this is a technology name
-                if TechnologyFilter.should_exclude(span_text):
+                # Get context for prefix checking
+                context_start = max(0, r.start - 50)
+                context_end = min(len(text), r.end + 50)
+                context = text[context_start:context_end]
+                
+                # Check if this is a technology name (with context for prefix checking)
+                if TechnologyFilter.should_exclude(span_text, context=context):
                     # This is a tech name, not a person
                     continue
                 
                 # Also check context - if it's in a tech stack context, exclude it
-                context_start = max(0, r.start - 50)
-                context_end = min(len(text), r.end + 50)
-                context = text[context_start:context_end].lower()
+                context_lower = context.lower()
                 
                 tech_context_patterns = [
                     r"used\s+tech[:\s]",
@@ -303,7 +439,7 @@ class TextAnonymizer:
                     r"technologien[:\s]",  # German: "Technologies"
                 ]
                 
-                in_tech_context = any(re.search(pattern, context) for pattern in tech_context_patterns)
+                in_tech_context = any(re.search(pattern, context_lower) for pattern in tech_context_patterns)
                 if in_tech_context:
                     # In tech context, likely not a person name
                     continue
@@ -312,13 +448,90 @@ class TextAnonymizer:
             elif r.entity_type == "LOCATION":
                 span_text = norm_space(text[r.start:r.end])
                 
+                # Get context for prefix checking
+                context_start = max(0, r.start - 50)
+                context_end = min(len(text), r.end + 50)
+                context = text[context_start:context_end]
+                
                 # Check if this is a technology name (misclassified as LOCATION)
-                if TechnologyFilter.should_exclude(span_text):
+                if TechnologyFilter.should_exclude(span_text, context=context):
                     # This is a tech name, not a location
                     continue
 
             out.append(r)
 
+        return out
+    
+    def _filter_technology_persons_with_full_context(
+        self, 
+        results: Sequence[RecognizerResult], 
+        analyzed_text: str,
+        full_text: str
+    ) -> List[RecognizerResult]:
+        """
+        Filter out PERSON entities that are technology names, using full text as context.
+        
+        This is used when we analyze only the first N characters but want to check
+        against the full document to catch technology names that appear later.
+        For example, if "Java" is detected in the first 200 chars, but "JavaScript"
+        appears later, we should exclude "Java" from obfuscation.
+        
+        Args:
+            results: RecognizerResult entities detected in analyzed_text
+            analyzed_text: The text that was analyzed (first N chars)
+            full_text: The complete text (for context checking)
+            
+        Returns:
+            Filtered list of RecognizerResult entities
+        """
+        if not results:
+            return []
+        
+        out: List[RecognizerResult] = []
+        for r in results:
+            # Filter PERSON entities that are cities or tech names
+            if r.entity_type == "PERSON":
+                span_text = norm_space(analyzed_text[r.start:r.end])
+                
+                # Check if this is a city name (misclassified as PERSON)
+                if CityNameFilter.should_exclude(span_text):
+                    continue
+                
+                # Use FULL TEXT as context for prefix checking
+                # This catches cases where "Java" is detected in first 200 chars
+                # but "JavaScript" appears later in the document
+                if TechnologyFilter.should_exclude(span_text, context=full_text):
+                    # This is a tech name, not a person
+                    continue
+                
+                # Also check context - if it's in a tech stack context, exclude it
+                full_text_lower = full_text.lower()
+                
+                tech_context_patterns = [
+                    r"used\s+tech[:\s]",
+                    r"technologies[:\s]",
+                    r"tech\s+stack[:\s]",
+                    r"skills[:\s]",
+                    r"tools[:\s]",
+                    r"eingesetzte\s+technologien[:\s]",  # German: "Used technologies"
+                ]
+                
+                # Check if span appears in a tech context anywhere in the full text
+                for pattern in tech_context_patterns:
+                    if re.search(pattern, full_text_lower):
+                        # Found tech context - check if span appears near it
+                        # Get a wider context around the span in analyzed text
+                        context_start = max(0, r.start - 100)
+                        context_end = min(len(analyzed_text), r.end + 100)
+                        local_context = analyzed_text[context_start:context_end].lower()
+                        
+                        # If span appears in tech context, exclude it
+                        if re.search(pattern, local_context):
+                            continue
+            
+            # Keep all non-PERSON entities and PERSON entities that passed filters
+            out.append(r)
+        
         return out
 
     # -----------------------
@@ -722,28 +935,28 @@ class TextAnonymizer:
 # -----------------------------
 if __name__ == "__main__":
     sample = """
-Lebenslauf
-
-Aleksandar Herman Balaban     
-Office: 06221 / 123456
-Mobile: +49 171 2345678
-
-Online Producer/Webdeveloper
-selbstständig freiberuflich
-
-Projects:
-
-2/2025 - 12/2025
-My last Java project    
-used tech: Java, Python, JavaScript, Oracle, MySQL, Kafka, Anthropic    
-2/1997 - 12/1998
-My first Java project für eine Hochschule
-Used tech: Python, Jenkins, Crew AI, JavaScript, Oracle, MySQL
-2/1997 - 12/1998
-My first Java project
-Verwendung von Prometheus für tracking
-Used tech: Python, Jenkins, Crew AI, JavaScript, Oracle, MySQL, Gradle    
-"""
+        Lebenslauf
+        
+        Aleksandar Herman Balaban     
+        Office: 06221 / 123456
+        Mobile: +49 171 2345678
+        
+        Online Producer/Webdeveloper
+        selbstständig freiberuflich
+        
+        Projects:
+        
+        2/2025 - 12/2025
+        My last Java project    
+        used tech: Java, Python, JavaScript, Oracle, MySQL, Kafka, Anthropic    
+        2/1997 - 12/1998
+        My first Java project für eine Hochschule
+        Used tech: Python, Jenkins, Crew AI, JavaScript, Oracle, MySQL
+        2/1997 - 12/1998
+        My first Java project
+        Verwendung von Prometheus für tracking
+        Used tech: Python, Jenkins, Crew AI, JavaScript, Oracle, MySQL, Gradle
+    """
 
     anonimizer = TextAnonymizer(AnonymizeConfig(debug=True, url_policy="keep_domain", pii_obfuscation_limit=0))
     result = anonimizer.anonymize(sample, preferred_language="de")

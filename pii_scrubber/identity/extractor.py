@@ -148,8 +148,11 @@ class NameCandidateExtractor:
                 continue
             if AddressFilter.should_exclude(frag):
                 continue
-            # Filter out technology names
-            if TechnologyFilter.should_exclude(frag):
+            # Filter out technology names (with context for prefix checking)
+            context_start = max(0, r.start - 50)
+            context_end = min(len(text), r.end + 50)
+            context = text[context_start:context_end]
+            if TechnologyFilter.should_exclude(frag, context=context):
                 continue
             
             # Clean name boundaries - remove common labels/prefixes
@@ -231,8 +234,9 @@ class NameCandidateExtractor:
                 cand = " ".join(name_like[:4])
                 if AddressFilter.should_exclude(cand):
                     continue
-                # Filter out technology names
-                if TechnologyFilter.should_exclude(cand):
+                # Filter out technology names (with context for prefix checking)
+                # Use the full line as context since we're extracting from header lines
+                if TechnologyFilter.should_exclude(cand, context=line):
                     continue
                 out.append({
                     "name": cand,
