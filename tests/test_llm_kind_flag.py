@@ -20,7 +20,7 @@ def test_llm_kind_flag_uses_factory(monkeypatch, tmp_path):
         return FakeClient()
 
     # monkeypatch the factory used by main
-    import cv_llm_converter as main_mod
+    import text_2_json_cli as main_mod
     monkeypatch.setattr(main_mod, "create_llm_client", fake_factory)
 
     out_file = tmp_path / "out.json"

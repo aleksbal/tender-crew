@@ -31,8 +31,9 @@ Dependencies:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, Set
+import json
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Sequence, Tuple, Set, Any
 from urllib.parse import urlparse
 
 from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern, RecognizerResult
@@ -985,6 +986,46 @@ class PrimaryIdentityResolver:
 
 
 # -----------------------------
+# Obfuscation Tracker
+# -----------------------------
+
+class ObfuscationTracker:
+    """
+    Tracks all obfuscations with unique numbered tokens.
+    """
+    def __init__(self):
+        self.counters: Dict[str, int] = {}
+        self.mappings: List[Dict[str, str]] = []
+    
+    def get_next_token(self, entity_type: str) -> str:
+        """Get the next numbered token for an entity type."""
+        if entity_type not in self.counters:
+            self.counters[entity_type] = 0
+        self.counters[entity_type] += 1
+        count = self.counters[entity_type]
+        return f"<{entity_type}{count}>"
+    
+    def record_obfuscation(self, token: str, original_value: str):
+        """Record an obfuscation mapping.
+        
+        Args:
+            token: The token used in the text (e.g., "<PERSON1>")
+            original_value: The original text that was obfuscated
+        """
+        # Extract key without angle brackets (e.g., "PERSON1" from "<PERSON1>")
+        # Remove < and > if present
+        key = token.strip("<>")
+        self.mappings.append({
+            "key": key,
+            "value": original_value
+        })
+    
+    def get_mappings(self) -> List[Dict[str, str]]:
+        """Get all obfuscation mappings."""
+        return self.mappings.copy()
+
+
+# -----------------------------
 # CvAnonymizer
 # -----------------------------
 
@@ -1020,10 +1061,80 @@ class CvAnonymizer:
             }
         else:
             self.operators = self.config.operators
+    
+    def _config_to_dict(self) -> Dict[str, Any]:
+        """Convert config to a dictionary for JSON serialization."""
+        config_dict = asdict(self.config)
+        # Convert operators if they exist
+        if config_dict.get("operators") is not None:
+            # Operators are OperatorConfig objects, convert to dict representation
+            ops_dict = {}
+            for key, op_config in config_dict["operators"].items():
+                if isinstance(op_config, OperatorConfig):
+                    ops_dict[key] = {
+                        "type": op_config.operator_name,
+                        "params": op_config.params
+                    }
+                else:
+                    ops_dict[key] = op_config
+            config_dict["operators"] = ops_dict
+        return config_dict
+    
+    def _replace_entities_with_tracking(
+        self,
+        text: str,
+        results: Sequence[RecognizerResult],
+        tracker: ObfuscationTracker
+    ) -> str:
+        """
+        Replace entities in text with numbered tokens and track each replacement.
+        Processes entities in reverse order of position to avoid offset issues.
+        """
+        # Sort results by position (reverse order for safe replacement)
+        sorted_results = sorted(results, key=lambda r: (r.start, r.end), reverse=True)
+        
+        out = text
+        for r in sorted_results:
+            entity_type = r.entity_type
+            original_value = _norm_space(text[r.start:r.end])
+            
+            # Skip if empty
+            if not original_value:
+                continue
+            
+            # Get next token for this entity type
+            token = tracker.get_next_token(entity_type)
+            
+            # Replace in text (using original positions from original text)
+            # Since we're processing in reverse, positions are still valid
+            out = out[:r.start] + token + out[r.end:]
+            
+            # Record the obfuscation
+            tracker.record_obfuscation(token, original_value)
+        
+        return out
 
-    def anonymize(self, text: str, preferred_language: str = "de") -> str:
+    def anonymize(self, text: str, preferred_language: str = "de") -> Dict[str, Any]:
+        """
+        Anonymize text and return a JSON structure with obfuscation details.
+        
+        Returns:
+            dict with keys:
+                - original_text: str - the original input text
+                - obfuscated_text: str - the text with PII obfuscated
+                - config: dict - the configuration used for masking
+                - obfuscations: list - list of dicts with 'key' and 'value' for each obfuscation
+        """
         if not text:
-            return text
+            return {
+                "original_text": text,
+                "obfuscated_text": text,
+                "config": self._config_to_dict(),
+                "obfuscations": []
+            }
+
+        # Create tracker for this anonymization session
+        tracker = ObfuscationTracker()
 
         # Apply PII obfuscation limit if configured
         if self.config.pii_obfuscation_limit > 0 and len(text) > self.config.pii_obfuscation_limit:
@@ -1032,21 +1143,35 @@ class CvAnonymizer:
             text_remainder = text[self.config.pii_obfuscation_limit:]
             
             # Anonymize only the first part
-            anonymized_part = self._anonymize_text(text_to_anonymize, preferred_language)
+            result = self._anonymize_text(text_to_anonymize, preferred_language, tracker)
             
-            # Return anonymized part + original remainder
-            return anonymized_part + text_remainder
+            # Combine anonymized part + original remainder
+            obfuscated_text = result["obfuscated_text"] + text_remainder
+            
+            return {
+                "original_text": text,
+                "obfuscated_text": obfuscated_text,
+                "config": self._config_to_dict(),
+                "obfuscations": tracker.get_mappings()
+            }
         else:
             # Process entire text (no limit)
-            return self._anonymize_text(text, preferred_language)
+            result = self._anonymize_text(text, preferred_language, tracker)
+            return {
+                "original_text": text,
+                "obfuscated_text": result["obfuscated_text"],
+                "config": self._config_to_dict(),
+                "obfuscations": tracker.get_mappings()
+            }
     
-    def _anonymize_text(self, text: str, preferred_language: str = "de") -> str:
+    def _anonymize_text(self, text: str, preferred_language: str, tracker: ObfuscationTracker) -> Dict[str, Any]:
         """
         Internal method that performs the actual anonymization.
         Separated to allow limiting obfuscation to a portion of text.
+        Returns dict with obfuscated_text.
         """
         if not text:
-            return text
+            return {"obfuscated_text": text}
 
         text_norm = normalize_text_for_matching(text)
 
@@ -1065,11 +1190,10 @@ class CvAnonymizer:
         extracted_urls = self._extract_entity_texts(text_norm, results, {"URL", "LINKEDIN_PROFILE"})
         extracted_emails = self._extract_entity_texts(text_norm, results, {"EMAIL_ADDRESS"})
 
-        # 4) First anonymization pass
-        anon = self.anonymizer.anonymize(text=text_norm, analyzer_results=collapsed, operators=self.operators)
-        out = anon.text
+        # 4) Replace entities with numbered tokens and track obfuscations
+        out = self._replace_entities_with_tracking(text_norm, collapsed, tracker)
 
-        # 5) Resolve primary identity + propagate variants / initials
+        # 6) Resolve primary identity + propagate variants / initials
         resolved = self.identity_resolver.resolve(
             text=text_norm,
             presidio_results=results,
@@ -1078,19 +1202,19 @@ class CvAnonymizer:
         )
 
         if self.config.propagate_primary_name and resolved["variants"]:
-            out = self._mask_variants(out, resolved["variants"], label="<PERSON>")
+            out = self._mask_variants_with_tracking(out, text_norm, resolved["variants"], tracker)
 
         if self.config.enable_initials and resolved["initials_patterns"]:
-            out = self._mask_initials(out, resolved["initials_patterns"], label="<PERSON>")
+            out = self._mask_initials_with_tracking(out, text_norm, resolved["initials_patterns"], tracker)
 
-        # 6) Combined URL policy + postprocessing pass
-        out = self._apply_url_policy_and_postprocess(out)
+        # 7) Combined URL policy + postprocessing pass
+        out = self._apply_url_policy_and_postprocess(out, tracker)
 
-        # 7) Debug
+        # 8) Debug
         if self.config.debug:
             self._print_debug(resolved)
 
-        return out
+        return {"obfuscated_text": out}
 
     # -----------------------
     # Phone date filtering
@@ -1191,7 +1315,7 @@ class CvAnonymizer:
     # Combined URL policy + postprocessing
     # -----------------------
 
-    def _apply_url_policy_and_postprocess(self, text: str) -> str:
+    def _apply_url_policy_and_postprocess(self, text: str, tracker: Optional[ObfuscationTracker] = None) -> str:
         """
         Combined pass: applies URL policy and postprocessing in a single traversal.
         More efficient than separate passes.
@@ -1209,24 +1333,58 @@ class CvAnonymizer:
 
             domain, has_path = self._parse_domain_and_path(raw)
             if not domain:
-                return "<URL>"
+                token = "<URL>"
+                if tracker:
+                    token = tracker.get_next_token("URL")
+                    tracker.record_obfuscation(token, raw)
+                return token
 
             if policy == "redact_all":
-                return "<URL>"
+                token = "<URL>"
+                if tracker:
+                    token = tracker.get_next_token("URL")
+                    tracker.record_obfuscation(token, raw)
+                return token
 
             if policy == "keep_domain":
+                # Keep domain, but track path obfuscation if present
+                if has_path and tracker:
+                    path_token = tracker.get_next_token("URL")
+                    tracker.record_obfuscation(path_token, raw)
+                    return f"{domain}/{path_token}"
                 return f"{domain}/<PATH>" if has_path else domain
 
             if policy == "allowlist_domains_keep_domain":
                 if domain in self.config.url_domain_allowlist:
+                    # Keep domain, but track path obfuscation if present
+                    if has_path and tracker:
+                        path_token = tracker.get_next_token("URL")
+                        tracker.record_obfuscation(path_token, raw)
+                        return f"{domain}/{path_token}"
                     return f"{domain}/<PATH>" if has_path else domain
-                return "<URL>"
+                token = "<URL>"
+                if tracker:
+                    token = tracker.get_next_token("URL")
+                    tracker.record_obfuscation(token, raw)
+                return token
 
-            return "<URL>"
+            token = "<URL>"
+            if tracker:
+                token = tracker.get_next_token("URL")
+                tracker.record_obfuscation(token, raw)
+            return token
 
         out = self._URL_FIND_RE.sub(url_repl, text)
 
         # Then apply postprocessing cleanup
+        # Note: We need to handle numbered tokens too (PERSON1, PERSON2, etc.)
+        # Pattern to match any numbered token: <ENTITY_TYPE followed by optional digits>
+        numbered_token_pattern = r"<([A-Z_]+)\d+>"
+        
+        # Collapse repeats for numbered tokens
+        out = re.sub(rf"(?:<[A-Z_]+\d+>[\s]*){{2,}}", lambda m: m.group(0).split()[0] + " ", out)
+        
+        # Also handle legacy unnumbered tokens
         tags = {
             "<PERSON>",
             "<ADDRESS>",
@@ -1238,7 +1396,7 @@ class CvAnonymizer:
             "<REDACTED>",
         }
 
-        # Collapse repeats for each token (individually)
+        # Collapse repeats for each legacy token (individually)
         for token in tags:
             out = re.sub(rf"(?:{re.escape(token)}[\s]*){{2,}}", token + " ", out)
 
@@ -1262,7 +1420,7 @@ class CvAnonymizer:
         Legacy method for backward compatibility.
         Delegates to combined method (URL policy with default settings).
         """
-        return self._apply_url_policy_and_postprocess(text)
+        return self._apply_url_policy_and_postprocess(text, tracker=None)
 
     # -----------------------
     # Analyzer + recognizers
@@ -1413,10 +1571,63 @@ class CvAnonymizer:
             out = re.sub(rf"\b{re.escape(v)}\b", label, out, flags=re.IGNORECASE)
         return out
 
+    def _mask_variants_with_tracking(
+        self, 
+        text: str, 
+        original_text: str, 
+        variants: Set[str], 
+        tracker: ObfuscationTracker
+    ) -> str:
+        """Mask variants and track each replacement."""
+        out = text
+        for v in sorted(variants, key=len, reverse=True):
+            # Find all matches in original text
+            pattern = rf"\b{re.escape(v)}\b"
+            matches = list(re.finditer(pattern, original_text, flags=re.IGNORECASE))
+            
+            if matches:
+                # Get next PERSON token
+                token = tracker.get_next_token("PERSON")
+                
+                # Replace in output text
+                out = re.sub(pattern, token, out, flags=re.IGNORECASE)
+                
+                # Record obfuscation (use first match's value as representative)
+                original_value = original_text[matches[0].start():matches[0].end()]
+                tracker.record_obfuscation(token, original_value)
+        
+        return out
+
     def _mask_initials(self, text: str, patterns: Sequence[str], label: str) -> str:
         out = text
         for pat in patterns:
             out = re.sub(pat, label, out)
+        return out
+
+    def _mask_initials_with_tracking(
+        self, 
+        text: str, 
+        original_text: str, 
+        patterns: Sequence[str], 
+        tracker: ObfuscationTracker
+    ) -> str:
+        """Mask initials patterns and track each replacement."""
+        out = text
+        for pat in patterns:
+            # Find all matches in original text
+            matches = list(re.finditer(pat, original_text))
+            
+            if matches:
+                # Get next PERSON token
+                token = tracker.get_next_token("PERSON")
+                
+                # Replace in output text
+                out = re.sub(pat, token, out)
+                
+                # Record obfuscation (use first match's value as representative)
+                original_value = original_text[matches[0].start():matches[0].end()]
+                tracker.record_obfuscation(token, original_value)
+        
         return out
 
 
@@ -1522,4 +1733,11 @@ Verwendung von Prometheus für tracking
 Used tech: Python, Jenkins, Crew AI, JavaScript, Oracle, MySQL, Gradle    
 """
     anon = CvAnonymizer(AnonymizeConfig(debug=True, url_policy="keep_domain"))
-    print(anon.anonymize(sample, preferred_language="de"))
+    result = anon.anonymize(sample, preferred_language="de")
+    print("=== OBFUSCATED TEXT ===")
+    print(result["obfuscated_text"])
+    print("\n=== OBFUSCATIONS ===")
+    for obf in result["obfuscations"]:
+        print(f"{obf['key']}: {obf['value']}")
+    print(f"\n=== CONFIG ===")
+    print(json.dumps(result["config"], indent=2, default=str))
