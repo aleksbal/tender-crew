@@ -15,9 +15,18 @@ class PatternRegistry:
     """
     
     # Email patterns
-    EMAIL_STANDARD = r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\b"
+    # Standard email: local@domain.tld
+    # Local part: alphanumeric, dots, underscores, plus, hyphens (but not consecutive dots or leading/trailing dots)
+    # Domain: alphanumeric, hyphens (but not leading/trailing hyphens)
+    # TLD: alphanumeric, hyphens, dots (for multi-part TLDs like co.uk)
+    EMAIL_STANDARD = r"\b[a-zA-Z0-9](?:[a-zA-Z0-9_.+-]*[a-zA-Z0-9])?@[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.[a-zA-Z0-9](?:[a-zA-Z0-9-.]*[a-zA-Z0-9])?\b"
     # Obfuscated emails: supports both English (at, dot) and German (at, punkt) obfuscation
-    EMAIL_OBFUSCATED = r"\b[a-zA-Z0-9_.+-]+\s*(?:\(|\[)?\s*(?:at|@)\s*(?:\)|\])?\s*[a-zA-Z0-9-]+\s*(?:\(|\[)?\s*(?:dot|punkt|\.)\s*(?:\)|\])?\s*[a-zA-Z0-9-.]+\b"
+    # Pattern: local [brackets?] at/@ [brackets?] domain [brackets?] dot/punkt/. [brackets?] tld
+    # IMPORTANT: The "at" or "@" is REQUIRED and must be a separate word/token
+    # This prevents false positives like "Cross-Platform-Basis. Entwicklung"
+    # The pattern requires word boundaries around "at" to ensure it's not part of another word
+    # Allows optional brackets around "at" and "dot" with flexible spacing
+    EMAIL_OBFUSCATED = r"\b[a-zA-Z0-9](?:[a-zA-Z0-9_.+-]*[a-zA-Z0-9])?\s*(?:\(|\[)?\s*\b(?:at|@)\b\s*(?:\)|\])?\s+[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\s*(?:\(|\[)?\s*\b(?:dot|punkt|\.)\b\s*(?:\)|\])?\s+[a-zA-Z0-9](?:[a-zA-Z0-9-.]*[a-zA-Z0-9])?\b"
     
     # Phone pattern: stricter to avoid matching dates
     # Note: We use a simpler pattern and validate in post-processing to exclude dates

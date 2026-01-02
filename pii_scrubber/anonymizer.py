@@ -255,44 +255,96 @@ class TextAnonymizer:
         full_text_norm = normalize_text_for_matching(full_text)
         text_to_analyze_norm = normalize_text_for_matching(text_to_analyze)
         
-        # 1) Analyze only the first N characters to detect PII entities
-        results = self._analyze_multi_pass(text_to_analyze_norm, preferred_language=preferred_language)
+        # 1) Analyze only the first N characters to detect PII entities (especially PERSON names)
+        # This prevents false positives when names appear later mixed with technologies
+        results_first_n = self._analyze_multi_pass(text_to_analyze_norm, preferred_language=preferred_language)
         
-        # 2) Filter out phone numbers that are actually dates (in analyzed portion)
-        results = self._filter_date_like_phones(results, text_to_analyze_norm)
+        # 2) Additionally, scan the ENTIRE text for simple pattern-based entities
+        # (EMAIL_ADDRESS, PHONE_NUMBER) - these are simple patterns, less likely to be false positives
+        # and should be detected throughout the document
+        simple_entity_types = {"EMAIL_ADDRESS", "PHONE_NUMBER"}
+        full_text_results = self._analyze_multi_pass(full_text_norm, preferred_language=preferred_language)
         
-        # 2b) Filter out PERSON entities that are technology names
+        # Filter full-text results to only simple pattern-based entities
+        full_text_simple = [
+            r for r in full_text_results 
+            if r.entity_type in simple_entity_types
+        ]
+        
+        # 3) Merge results: use results from first N chars, but replace simple entities with full-text versions
+        # This ensures we catch emails/phones throughout the document
+        # Build a set of entity keys from first N chars (for non-simple entities and to detect duplicates)
+        results = []
+        seen_entities = set()  # (entity_type, normalized_text_lower)
+        
+        # First, add all non-simple entities from first N chars
+        for r in results_first_n:
+            if r.entity_type not in simple_entity_types:
+                # For non-simple entities, use positions relative to text_to_analyze_norm
+                # But we need to adjust them to be relative to full_text_norm
+                # Since text_to_analyze_norm is a prefix, positions should be the same
+                results.append(r)
+                entity_text = norm_space(text_to_analyze_norm[r.start:r.end])
+                seen_entities.add((r.entity_type, entity_text.lower()))
+        
+        # Then, add simple entities from full text (these have positions relative to full_text_norm)
+        for r in full_text_simple:
+            entity_text = norm_space(full_text_norm[r.start:r.end])
+            entity_key = (r.entity_type, entity_text.lower())
+            if entity_key not in seen_entities:
+                results.append(r)
+                seen_entities.add(entity_key)
+        
+        # Also add simple entities from first N chars if they weren't already added
+        for r in results_first_n:
+            if r.entity_type in simple_entity_types:
+                entity_text = norm_space(text_to_analyze_norm[r.start:r.end])
+                entity_key = (r.entity_type, entity_text.lower())
+                if entity_key not in seen_entities:
+                    # Adjust position to be relative to full_text_norm (should be same since it's a prefix)
+                    results.append(r)
+                    seen_entities.add(entity_key)
+        
+        # 4) Filter out phone numbers that are actually dates (using full_text_norm for context)
+        results = self._filter_date_like_phones(results, full_text_norm)
+        
+        # 5) Filter out PERSON entities that are technology names
         # IMPORTANT: Use full_text_norm as context to catch technology names that appear later
         # This prevents obfuscating "Java" when "JavaScript" appears later in the document
         results = self._filter_technology_persons_with_full_context(results, text_to_analyze_norm, full_text_norm)
         
-        # 3) Collapse overlaps (priority-based)
-        collapsed = self._collapse_overlaps(results, text_to_analyze_norm)
+        # 6) Collapse overlaps (priority-based) - using full_text_norm for positions
+        collapsed = self._collapse_overlaps(results, full_text_norm)
         
-        # Extract URLs and emails from analyzed portion for identity resolution
-        extracted_urls = self._extract_entity_texts(text_to_analyze_norm, results, {"URL", "LINKEDIN_PROFILE"})
-        extracted_emails = self._extract_entity_texts(text_to_analyze_norm, results, {"EMAIL_ADDRESS"})
+        # Extract URLs and emails from first N chars for identity resolution
+        # (We only use first N chars for identity resolution to avoid false positives)
+        results_for_identity = [r for r in results_first_n if r.entity_type in {"URL", "LINKEDIN_PROFILE", "EMAIL_ADDRESS"}]
+        extracted_urls = self._extract_entity_texts(text_to_analyze_norm, results_for_identity, {"URL", "LINKEDIN_PROFILE"})
+        extracted_emails = self._extract_entity_texts(text_to_analyze_norm, results_for_identity, {"EMAIL_ADDRESS"})
         
-        # 4) Resolve primary identity from the analyzed portion FIRST
+        # 7) Resolve primary identity from the analyzed portion FIRST
         # This extracts the actual PII values (names, variants, initials) that we'll use
+        # Use only results from first N chars for identity resolution (to avoid false positives)
         resolved = self.identity_resolver.resolve(
             text=text_to_analyze_norm,
-            presidio_results=results,
+            presidio_results=results_first_n,
             extracted_urls=extracted_urls,
             extracted_emails=extracted_emails,
         )
         
-        # 5) Now apply obfuscation to the ENTIRE text using the detected PII values
+        # 8) Now apply obfuscation to the ENTIRE text using the detected PII values
         # Start with the full text
         out = full_text_norm
         
         # First, replace non-PERSON entities (phones, emails, addresses, etc.) throughout entire text
         # Extract unique PII values from detected entities
+        # Note: collapsed results have positions relative to full_text_norm
         pii_values = {}  # Map: (entity_type, value_lower) -> (token, original_value)
         
         for r in collapsed:
             entity_type = r.entity_type
-            original_value = norm_space(text_to_analyze_norm[r.start:r.end])
+            # Use full_text_norm since collapsed positions are relative to it
+            original_value = norm_space(full_text_norm[r.start:r.end])
             
             if not original_value:
                 continue
@@ -321,9 +373,10 @@ class TextAnonymizer:
         if self.config.enable_initials and resolved["initials_patterns"]:
             out = self._mask_initials_with_tracking(out, full_text_norm, resolved["initials_patterns"], tracker)
         
-        # 7) Also replace PERSON entities detected in first N chars throughout entire text
+        # 9) Also replace PERSON entities detected in first N chars throughout entire text
         # (in case variant propagation didn't catch them all)
-        for r in collapsed:
+        # Use results_first_n for PERSON entities (positions relative to text_to_analyze_norm)
+        for r in results_first_n:
             if r.entity_type == "PERSON":
                 original_value = norm_space(text_to_analyze_norm[r.start:r.end])
                 if not original_value:
@@ -350,10 +403,10 @@ class TextAnonymizer:
                     # Replace remaining occurrences
                     out = re.sub(pattern, token, out, flags=re.IGNORECASE)
         
-        # 8) Apply URL policy and postprocessing to entire text
+        # 10) Apply URL policy and postprocessing to entire text
         out = self._apply_url_policy_and_postprocess(out, tracker)
         
-        # 9) Debug
+        # 11) Debug
         if self.config.debug:
             self._print_debug(resolved)
         
@@ -937,7 +990,7 @@ if __name__ == "__main__":
     sample = """
         Lebenslauf
         
-        Aleksandar Herman Balaban     
+        Alex Herman     
         Office: 06221 / 123456
         Mobile: +49 171 2345678
         
