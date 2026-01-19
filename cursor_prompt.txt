@@ -1,0 +1,16 @@
+
+
+the component cv_text_scrubber has almost 2k code lines in a single file.
+propose refactoring to split it into several subcomponents, have unit tests etc. think to put it in a dedicaated folder to distinct from other project parts.
+propose industry standard solution in such cases
+
+
+New feature:
+class CvAnonymizer, method anonymize - instead of returning obfuscated text as string, it should return a json structure having:
+- original text
+- PII obfuscated text
+- Config details used for masking (self.config)
+- list with key/value pairs for every individual obfuscation done. Examples:
+    - Person tokens should be replaced with for example a token '<PERSON1> (currently it is <PERSON> - without numeric suffix) and the list should contain an item ('PERSON3','Max Musterman')
+    - Same should be done for LOCATION, PHONE and other classes of items obfuscated already used.
+    - keys must of course be unique, so in case of LOCATION, we could end up having LOCATION1, LOCATION2, LOCATION3 etc.

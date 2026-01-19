@@ -18,6 +18,10 @@ openai>=1.0
 # pre-commit>=3.0
 # mypy>=1.0
 
+# Elasticsearch
+elasticsearch>=8.0.0
+sentence-transformers>=2.2.0
+
 # Tools (install via system package manager):
 # - qpdf (useful for PDF tooling)
 # - ghostscript / poppler-utils (PDF handling utilities)
